@@ -19,6 +19,7 @@ __pycache__/
 logs/
 *.log
 gift_board.json
+/piper_voices/
 
 # ============ macOS ============
 .DS_Store

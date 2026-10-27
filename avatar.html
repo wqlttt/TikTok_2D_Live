@@ -138,12 +138,32 @@
     }
   }
 
-  // 主循环：口型平滑 + 写入 Live2D 参数
-  var t0 = performance.now();
-  function loop(){
+  // 主循环：口型平滑 + 写入 Live2D 参数 + 肢体动作
+  function applyGestures(now){
+    if (!coreModel) return;
+    var t = now / 1000;
+    if (speaking) {
+      // 说话时：轻微转头 + 双手轻摆（像在比划）
+      coreModel.addParameterValueById("ParamAngleY", Math.sin(t * 3.0) * 2.0);
+      coreModel.addParameterValueById("ParamAngleZ", Math.sin(t * 5.2) * 2.5);
+      var ph = 0.5 + 0.5 * Math.sin(t * 2.6);
+      coreModel.setParameterValueById("ParamHandL", ph * 0.6);
+      coreModel.setParameterValueById("ParamHandR", (1 - ph) * 0.6);
+    } else {
+      // 待机：偶尔耸肩
+      var cyc = now % 7000;
+      var shrug = cyc > 6300 ? Math.sin((cyc - 6300) / 700 * Math.PI) * 0.6 : 0;
+      coreModel.setParameterValueById("ParamShoulder", shrug);
+      coreModel.setParameterValueById("ParamHandL", 0);
+      coreModel.setParameterValueById("ParamHandR", 0);
+    }
+  }
+
+  function loop(now){
     currentOpen += (targetOpen - currentOpen) * 0.3;
     if (coreModel) {
       coreModel.setParameterValueById("ParamMouthOpenY", currentOpen);
+      applyGestures(now || performance.now());
     }
     requestAnimationFrame(loop);
   }

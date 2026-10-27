@@ -145,6 +145,48 @@ def say_tts(text, voice):
     return out
 
 
+_PIPER_VOICE = None
+
+
+def _load_piper():
+    """懒加载 Piper 音色（zh_CN-xiao_ya），只加载一次。"""
+    global _PIPER_VOICE
+    if _PIPER_VOICE is None:
+        from piper import PiperVoice
+        from pathlib import Path
+        _PIPER_VOICE = PiperVoice.load(
+            Path("piper_voices/zh_CN-xiao_ya-medium.onnx"),
+            download_dir=Path("piper_voices"),
+        )
+    return _PIPER_VOICE
+
+
+def piper_tts(text):
+    """本地 Piper TTS：预热后极快（约 20 倍实时）。输出 22050Hz wav。"""
+    voice = _load_piper()
+    import numpy as np
+    import wave
+    os.makedirs("audio", exist_ok=True)
+    out = os.path.join("audio", f"reply_{int(time.time() * 1000)}.wav")
+    chunks = list(voice.synthesize(text))
+    pcm = np.concatenate([c.audio_int16_array for c in chunks])
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(22050)
+        w.writeframes(pcm.astype(np.int16).tobytes())
+    return out
+
+
+def _warmup_piper():
+    """后台预热：加载模型 + 跑一次空合成，避免第一条回复卡顿。"""
+    try:
+        v = _load_piper()
+        list(v.synthesize("。"))
+    except Exception:
+        pass
+
+
 def pick_say_voice(content):
     """本地模式：按弹幕关键词选择 macOS `say` 音色，返回 (voice, 标签)。"""
     default = env("SAY_VOICE", "Tingting")
@@ -198,9 +240,15 @@ def finish_reply(reply, voice_label, user, content, timings, say_voice=None):
     """合成语音 + 更新状态 + 入回复队列（chat/gift/speak 共用）。"""
     global LATEST, LATEST_AUDIO, REPLY_SEQ
     reply = filter_reply(reply)   # 本地敏感词兜底
-    say_voice = say_voice or env("SAY_VOICE", "Tingting")
+    text = strip_emoji(reply)
     t0 = time.time()
-    wav_path = say_tts(strip_emoji(reply), say_voice)
+    if TTS_BACKEND == "piper":
+        try:
+            wav_path = piper_tts(text)
+        except Exception:
+            wav_path = say_tts(text, say_voice or env("SAY_VOICE", "Tingting"))
+    else:
+        wav_path = say_tts(text, say_voice or env("SAY_VOICE", "Tingting"))
     timings["tts"] = round(time.time() - t0, 2)
     with LOCK:
         LATEST_AUDIO = wav_path
@@ -257,7 +305,7 @@ def process_one(item):
         if user:
             USER_MEMORY.setdefault(user, deque(maxlen=3)).append((content, reply))
 
-        if TTS_BACKEND == "local":
+        if TTS_BACKEND in ("local", "piper"):
             say_voice, voice_label = pick_say_voice(content)
             finish_reply(reply, voice_label, user, content, timings, say_voice=say_voice)
         else:
@@ -511,6 +559,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if TTS_BACKEND == "piper":
+        _warmup_piper()  # 同步预热（阻塞几秒，避免与 worker 线程竞争加载 g2pw 模型）
     threading.Thread(target=worker, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"数字人桥已启动：http://{HOST}:{PORT}")
