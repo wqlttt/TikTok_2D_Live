@@ -4,10 +4,11 @@
 douyinLive/config.yaml
 cyber-xiaoya-danmaku/config.json
 
-# ============ 第三方仓库：各自独立 clone（见 README）============
+# ============ 第三方仓库 / 大型资产：各自独立下载（见 README / setup.sh）============
 /cyber-xiaoya-danmaku/
 /douyinLive/
 /live2d_samples/
+/live2d/
 
 # ============ 运行时产物 ============
 /audio/
@@ -17,6 +18,7 @@ __pycache__/
 *.pyo
 logs/
 *.log
+gift_board.json
 
 # ============ macOS ============
 .DS_Store

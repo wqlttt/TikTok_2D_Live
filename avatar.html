@@ -6,33 +6,60 @@
 <title>赛博小雅 · Live2D 虚拟人</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:transparent;}
-  body{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  body{display:flex;align-items:center;justify-content:center;
        font-family:-apple-system,"PingFang SC",sans-serif;}
-  #stage{position:relative;width:min(72vh,92vw);aspect-ratio:400/520;}
+  #wrap{display:flex;flex-direction:row;align-items:center;gap:22px;}
+  #stage{position:relative;width:min(64vh,78vw);aspect-ratio:400/520;}
   #stage::before{content:"";position:absolute;inset:0;border-radius:24px;
     background:radial-gradient(circle at 50% 30%,#fff6ef 0%,#ffe3ee 52%,#ffcfe0 100%);
     box-shadow:0 18px 60px rgba(0,0,0,.18);}
   #l2d{position:absolute;inset:0;width:100%;height:100%;}
   #l2d-status{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);
     text-align:center;color:#b0556b;font-size:14px;padding:0 16px;}
-  #subtitle{position:relative;margin-top:14px;max-width:80vw;min-height:1.4em;
-    font-size:20px;color:#5b3b4a;text-align:center;text-shadow:0 1px 0 #fff;
-    padding:6px 18px;border-radius:999px;background:rgba(255,255,255,.7);}
-  #subtitle:empty{display:none;}
+  #speech{position:relative;flex:0 0 min(320px,26vw);
+    padding:16px 22px;background:#fff;border-radius:20px;
+    box-shadow:0 8px 28px rgba(0,0,0,.22);font-size:24px;font-weight:600;
+    color:#3a2b33;line-height:1.5;text-align:left;z-index:4;
+    opacity:0;transition:opacity .35s;pointer-events:none;}
+  #speech.show{opacity:1;}
+  #speech::after{content:"";position:absolute;top:50%;left:-13px;
+    transform:translateY(-50%);border:13px solid transparent;
+    border-right-color:#fff;border-left:0;}
   #danmaku-layer{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:5;}
   .danmaku{position:absolute;left:100%;white-space:nowrap;font-size:20px;font-weight:600;
     color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.55),0 0 8px rgba(0,0,0,.3);
     animation:danmaku-move 9s linear forwards;}
   @keyframes danmaku-move{to{transform:translateX(-130vw);}}
+  #status-badge{position:fixed;right:16px;bottom:16px;padding:8px 14px;
+    border-radius:999px;background:rgba(30,20,30,.72);color:#fff;font-size:14px;
+    font-weight:600;display:flex;align-items:center;gap:8px;z-index:99;
+    box-shadow:0 4px 16px rgba(0,0,0,.3);backdrop-filter:blur(6px);}
+  #status-badge .dot{width:10px;height:10px;border-radius:50%;background:#ffb340;flex:0 0 auto;}
+  #start-hint{position:fixed;right:16px;bottom:60px;z-index:100;}
+  #start-btn{padding:5px 12px;font-size:12px;font-weight:600;color:#fff;background:#ff5f87;
+    border:none;border-radius:999px;cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,.3);opacity:.92;}
+  #gift-board{position:fixed;left:16px;top:16px;padding:12px 16px;
+    background:rgba(30,20,30,.72);color:#fff;border-radius:16px;z-index:90;
+    font-size:14px;min-width:150px;backdrop-filter:blur(6px);
+    box-shadow:0 4px 16px rgba(0,0,0,.3);display:none;}
+  #gift-board .gb-title{font-weight:700;font-size:13px;opacity:.95;margin-bottom:6px;}
+  #gift-board .gb-row{display:flex;justify-content:space-between;gap:14px;line-height:1.55;}
+  #gift-board .gb-nick{color:#ffd166;font-weight:600;}
 </style>
 </head>
 <body>
-  <div id="stage">
+  <div id="wrap">
+    <div id="stage">
     <canvas id="l2d"></canvas>
     <div id="l2d-status">正在加载模型…</div>
     <div id="danmaku-layer"></div>
+    </div>
+    <div id="speech"></div>
   </div>
-  <div id="subtitle"></div>
+
+  <div id="status-badge"><span class="dot"></span><span id="status-text">连接中…</span></div>
+  <div id="gift-board"></div>
+  <div id="start-hint"><button id="start-btn">▶ 点击开始 · 解锁声音</button></div>
 
 <script src="/live2d/pixi.min.js"></script>
 <script src="/live2d/live2dcubismcore.min.js"></script>
@@ -42,15 +69,59 @@
   "use strict";
   var W = 800, H = 1040;           // 内部渲染分辨率（2x，更清晰）
   var app = null, model = null, coreModel = null, motionManager = null;
-  var subtitle = document.getElementById("subtitle");
+  var currentModelName = "Hiyori";
+  var speechEl = document.getElementById("speech");
+  var statusDot = document.querySelector("#status-badge .dot");
+  var statusText = document.getElementById("status-text");
+  var startHint = document.getElementById("start-hint");
   var statusEl = document.getElementById("l2d-status");
 
   var currentOpen = 0, targetOpen = 0;
   var speaking = false;
-  var lastReply = "", lastDanmaku = "";
+  var lastDanmaku = "";
   var audioCtx = null, analyser = null;
 
   function setOpenness(o){ targetOpen = o; }
+
+  var loadToken = 0;
+
+  async function loadModel(name){
+    var myToken = ++loadToken;
+    try {
+      var m = await PIXI.live2d.Live2DModel.from(
+        "/live2d/" + name + "/" + name + ".model3.json",
+        { motionPreload: "IDLE", idleMotionGroup: "None" }
+      );
+      if (myToken !== loadToken){   // 期间已有更新的加载请求，丢弃本次结果
+        try { m.destroy(); } catch(e){}
+        return;
+      }
+      if (model){
+        app.stage.removeChild(model);
+        try { model.destroy(); } catch(e){}
+      }
+      model = m;
+      app.stage.addChild(model);
+
+      // 居中 + 适配
+      model.anchor.set(0.5, 0.5);
+      var s = Math.min(W / model.width, H / model.height) * 1.12;
+      model.scale.set(s);
+      model.x = W / 2;
+      model.y = H / 2;
+
+      coreModel = model.internalModel.coreModel;
+      motionManager = model.internalModel.motionManager;
+      // 自动 Idle 动作会驱动嘴部，和音频口型冲突，已通过 idleMotionGroup:"None" 关闭；
+      // 眨眼/呼吸由内置组件自动处理。
+      statusEl.style.display = "none";
+    } catch(e){
+      if (myToken === loadToken){
+        statusEl.textContent = "模型加载失败：" + (e && e.message ? e.message : e);
+      }
+      console.error("loadModel failed:", e);
+    }
+  }
 
   async function init(){
     try {
@@ -60,24 +131,7 @@
         width: W, height: H,
         backgroundAlpha: 0
       });
-      model = await PIXI.live2d.Live2DModel.from(
-        "/live2d/Hiyori/Hiyori.model3.json",
-        { motionPreload: "IDLE", idleMotionGroup: "None" }
-      );
-      app.stage.addChild(model);
-
-      // 居中 + 适配（Hiyori 画布近似正方形，按高度填满再略放大）
-      model.anchor.set(0.5, 0.5);
-      var s = Math.min(W / model.width, H / model.height) * 1.12;
-      model.scale.set(s);
-      model.x = W / 2;
-      model.y = H / 2;
-
-      coreModel = model.internalModel.coreModel;
-      motionManager = model.internalModel.motionManager;
-      // 注意：自动 Idle 动作会驱动嘴部(ParamMouthOpenY)，和音频口型冲突，
-      // 已在上面通过 idleMotionGroup:"None" 关闭；眨眼/呼吸由内置组件自动处理。
-      statusEl.style.display = "none";
+      await loadModel(currentModelName);
     } catch(e){
       statusEl.textContent = "模型加载失败：" + (e && e.message ? e.message : e);
       console.error("Live2D init failed:", e);
@@ -105,68 +159,184 @@
     if (audioCtx.state === "suspended") audioCtx.resume();
   }
 
-  async function playAndAnimate(){
-    try {
-      ensureAudio();
-      var resp = await fetch("/audio?t=" + Date.now());
-      if (!resp.ok) return;
-      var buf = await resp.arrayBuffer();
-      var audioBuf = await audioCtx.decodeAudioData(buf);
-      var src = audioCtx.createBufferSource();
-      src.buffer = audioBuf;
-      src.connect(analyser);
-
-      var data = new Uint8Array(analyser.fftSize);
-      speaking = true;
-      function drive(){
-        if (!speaking) return;
-        analyser.getByteTimeDomainData(data);
-        var sum = 0;
-        for (var i = 0; i < data.length; i++){
-          var v = (data[i] - 128) / 128;
-          sum += v * v;
-        }
-        var rms = Math.sqrt(sum / data.length);
-        setOpenness(Math.min(1, rms * 5));
-        requestAnimationFrame(drive);
-      }
-      src.onended = function(){ speaking = false; setOpenness(0); };
-      src.start();
-      drive();
-    } catch(e){
-      console.warn("audio play blocked:", e);
-    }
+  function showSpeech(text){
+    speechEl.textContent = text;
+    speechEl.classList.add("show");
   }
 
-  function spawnDanmaku(text){
+  function hideSpeech(){
+    speechEl.classList.remove("show");
+  }
+
+  function playAudio(seq){
+    return new Promise(function(resolve){
+      try {
+        ensureAudio();
+        fetch("/audio?seq=" + seq + "&t=" + Date.now())
+          .then(function(r){ if(!r.ok) throw new Error("bad"); return r.arrayBuffer(); })
+          .then(function(buf){ return audioCtx.decodeAudioData(buf); })
+          .then(function(audioBuf){
+            var src = audioCtx.createBufferSource();
+            src.buffer = audioBuf;
+            src.connect(analyser);
+
+            var data = new Uint8Array(analyser.fftSize);
+            speaking = true;
+            function drive(){
+              if (!speaking) return;
+              analyser.getByteTimeDomainData(data);
+              var sum = 0;
+              for (var i = 0; i < data.length; i++){
+                var v = (data[i] - 128) / 128;
+                sum += v * v;
+              }
+              setOpenness(Math.min(1, Math.sqrt(sum / data.length) * 5));
+              requestAnimationFrame(drive);
+            }
+            src.onended = function(){ speaking = false; setOpenness(0); resolve(); };
+            src.start();
+            drive();
+          })
+          .catch(function(){ resolve(); });
+      } catch(e){ resolve(); }
+    });
+  }
+
+  var playQueue = [];
+  var lastPlayedSeq = 0;
+  var isPlaying = false;
+  var queueInit = false;
+
+  function enqueueReplies(replies){
+    if (!replies || replies.length === 0) return;
+    // 首次加载：跳到当前最新一条，不重播历史（避免刷新后卡住）
+    if (!queueInit){
+      queueInit = true;
+      for (var i = 0; i < replies.length; i++){
+        if (replies[i].seq > lastPlayedSeq) lastPlayedSeq = replies[i].seq;
+      }
+      return;
+    }
+    for (var i = 0; i < replies.length; i++){
+      var r = replies[i];
+      if (r.seq > lastPlayedSeq){
+        lastPlayedSeq = r.seq;
+        playQueue.push(r);
+      }
+    }
+    if (!isPlaying) playNext();
+  }
+
+  function playNext(){
+    if (playQueue.length === 0){
+      isPlaying = false;
+      setTimeout(hideSpeech, 600);   // 队列空，语音播完后稍作停留再隐藏气泡
+      return;
+    }
+    isPlaying = true;
+    var item = playQueue.shift();
+    showSpeech(item.reply);
+    playAudio(item.seq).then(function(){ playNext(); });
+  }
+
+  function nickColor(nick){
+    var hash = 0;
+    for (var i = 0; i < nick.length; i++){ hash = (hash * 31 + nick.charCodeAt(i)) >>> 0; }
+    return "hsl(" + (hash % 360) + ", 90%, 70%)";
+  }
+
+  function spawnDanmaku(nick, content){
     var layer = document.getElementById("danmaku-layer");
     var el = document.createElement("div");
     el.className = "danmaku";
-    el.textContent = text;
+    if (nick){
+      var n = document.createElement("span");
+      n.style.color = nickColor(nick);
+      n.textContent = nick;
+      el.appendChild(n);
+      el.appendChild(document.createTextNode("：" + content));
+    } else {
+      el.textContent = content;
+    }
     el.style.top = (4 + Math.random() * 30) + "%";
     layer.appendChild(el);
     el.addEventListener("animationend", function(){ el.remove(); });
     while (layer.children.length > 40) layer.firstChild.remove();
   }
 
+  function fmtAgo(sec){
+    if (sec < 60) return sec + " 秒";
+    if (sec < 3600) return Math.floor(sec / 60) + " 分钟";
+    return Math.floor(sec / 3600) + " 小时";
+  }
+
+  function updateGiftBoard(board){
+    var el = document.getElementById("gift-board");
+    if (!board || board.length === 0){
+      el.style.display = "none";
+      return;
+    }
+    el.style.display = "block";
+    var html = '<div class="gb-title">🎁 礼物榜</div>';
+    for (var i = 0; i < Math.min(board.length, 5); i++){
+      var nick = board[i][0] || "?";
+      var val = board[i][1] || 0;
+      html += '<div class="gb-row"><span class="gb-nick">' + (i + 1) + '. ' + nick + '</span><span>' + val + ' 💎</span></div>';
+    }
+    el.innerHTML = html;
+  }
+
+  function updateStatus(s){
+    var dot = "#ffb340", text = "连接中…";
+    if (speaking){
+      dot = "#4cd964"; text = "正在说…";
+    } else if (s.status === "processing" || s.status === "queued"){
+      dot = "#ffb340"; text = "正在想…";
+    } else if (s.status === "error"){
+      dot = "#ff5f57"; text = "出错";
+    } else {
+      dot = "#34c759"; text = "在线 · 就绪";
+    }
+    if (!speaking && s.last_danmaku_at){
+      var ago = Math.max(0, Math.round(Date.now() / 1000 - s.last_danmaku_at));
+      text += " · 弹幕 " + fmtAgo(ago) + "前";
+    }
+    statusDot.style.background = dot;
+    statusText.textContent = text;
+  }
+
   async function poll(){
     try {
       var r = await fetch("/api/state");
       var s = await r.json();
-      subtitle.textContent = s.reply || "";
-      if (s.reply && s.reply !== lastReply){
-        lastReply = s.reply;
-        playAndAnimate();
+      updateStatus(s);
+      if (s.gift_board) updateGiftBoard(s.gift_board);
+      if (s.model && s.model !== currentModelName){
+        currentModelName = s.model;
+        loadModel(currentModelName);
       }
+      if (s.replies && s.replies.length) enqueueReplies(s.replies);
       if (s.content && s.content !== lastDanmaku){
         lastDanmaku = s.content;
-        var who = s.user || "";
-        spawnDanmaku(who ? (who + "：" + s.content) : s.content);
+        spawnDanmaku(s.user || "", s.content);
       }
-    } catch(e){}
+    } catch(e){
+      statusDot.style.background = "#ff5f57";
+      statusText.textContent = "离线 · 桥未连接";
+    }
   }
 
-  document.addEventListener("pointerdown", function(){ ensureAudio(); });
+  document.addEventListener("pointerdown", function(){
+    ensureAudio();
+    if (startHint) startHint.style.display = "none";
+  });
+  // 环境已允许自动播放时（如 OBS 浏览器源）自动隐藏提示
+  setTimeout(function(){
+    try {
+      ensureAudio();
+      if (audioCtx && audioCtx.state === "running") startHint.style.display = "none";
+    } catch(e){}
+  }, 800);
   setInterval(poll, 1500);
   poll();
   init();

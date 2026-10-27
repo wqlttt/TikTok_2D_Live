@@ -38,6 +38,7 @@
 ├── bridge.py            # 数字人桥：/api/danmaku 收弹幕 → DeepSeek → TTS → 状态/音频服务
 ├── verify_pipeline.py   # 最小验证脚本（一次性走通链路 + 延迟统计）
 ├── avatar.html          # Live2D 播放器（渲染 + 口型 + 弹幕飘屏 + 字幕）
+├── setup.sh             # 一键部署脚本（下载运行库/模型/弹幕依赖）
 ├── config/
 │   ├── config.example.yaml   # 主配置模板
 │   └── persona_prompt.md     # DeepSeek 人设提示词
@@ -52,6 +53,16 @@
 ```
 
 ## 快速开始
+
+### 0. 一键部署（推荐）
+
+```bash
+bash setup.sh
+```
+
+脚本会自动：下载 Live2D 运行库（PixiJS + Cubism Core + 渲染库）、下载 8 个官方模型、克隆并编译弹幕采集依赖、生成 `.env`。
+
+> 模型约 24MB、不在本仓库内，由脚本从官方仓库拉取；嫌慢也可手动只下你需要的几个（见 §换 Live2D 模型）。
 
 ### 1. 环境
 

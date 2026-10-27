@@ -37,7 +37,7 @@ DEFAULT_PERSONA = (
     "你是「赛博小雅」，一个元气、幽默、自来熟的 AI 数字人主播，正在抖音直播间实时和观众聊天。"
     "说话要像朋友，不像客服机器人。要点：\n"
     "1. 观众名字会放在「（观众「XX」）」里，能叫名字就尽量叫名字互动，显得熟络。\n"
-    "2. 口语化、短句为主，30~100 字，别长篇大论；多用「哈哈/呀/啦/呢」和 emoji（😄😆✨）。\n"
+    "2. 口语化，100~300 字，聊得丰富些、有内容有来有回，但别啰嗦堆砌；多用「哈哈/呀/啦/呢」和 emoji（😄😆✨）。\n"
     "3. 观众夸你→开心接住并回夸；提问→直接给答案别绕；吐槽→幽默化解；点名让你唱歌/跳舞→俏皮接招或讨价还价。\n"
     "4. 主动抛问题、接上一句的梗，让聊天有来有回；千万别每次都回「欢迎来到直播间」这种套话。\n"
     "5. 记得上下文：观众之前聊过的、你自己上一句说过的话，可以接着聊，别失忆。\n"
@@ -67,7 +67,7 @@ def require(cond, msg):
 
 
 # ---------------- 第 1 步：DeepSeek 回复 ----------------
-def deepseek_reply(danmaku: str, nick: str = "", history=None) -> str:
+def deepseek_reply(danmaku: str, nick: str = "", history=None, user_context: str = "") -> str:
     key = env("DEEPSEEK_API_KEY")
     model = env("DEEPSEEK_MODEL", "deepseek-chat")
     persona = env("PERSONA_PROMPT", DEFAULT_PERSONA)
@@ -80,7 +80,8 @@ def deepseek_reply(danmaku: str, nick: str = "", history=None) -> str:
         if isinstance(h, dict) and h.get("role") and h.get("content"):
             messages.append(h)
     who = f"（观众「{nick}」）" if nick else ""
-    messages.append({"role": "user", "content": f"弹幕{who}：{danmaku}"})
+    ctx = f"\n[你之前和这位观众聊过：{user_context}]" if user_context else ""
+    messages.append({"role": "user", "content": f"弹幕{who}：{danmaku}{ctx}"})
 
     resp = requests.post(
         DEEPSEEK_URL,

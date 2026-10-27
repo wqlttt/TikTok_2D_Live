@@ -19,6 +19,7 @@
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -55,6 +56,65 @@ _last_content = ""
 LATEST_AUDIO = ""          # 本地 TTS 产出的最新 wav 路径
 TTS_BACKEND = env("TTS_BACKEND", "local").lower()   # local(本地 say) | vidu(云端对口型)
 HISTORY = deque(maxlen=int(env("HISTORY_TURNS", "8") or 8))   # 记忆最近 N 轮对话，让回复能接上下文
+USER_MEMORY = {}           # 昵称 -> deque([(弹幕, 回复), ...]) 按人记忆，提升用户亲和性
+REPLIES = deque(maxlen=30) # 已完成的回复队列（供前端排队播放，避免下一条覆盖上一条）
+REPLY_SEQ = 0
+REPLY_AUDIO = {}           # seq -> 音频文件路径
+STARTED_AT = time.time()   # 桥启动时间(epoch)
+LAST_DANMAKU_TIME = None   # 上次收到弹幕的时间戳(epoch)，用于前端"是否在线"提示
+MODELS = ["Hiyori", "Haru", "Mao", "Natori", "Ren", "Rice", "Mark", "Wanko"]
+CURRENT_MODEL = "Hiyori"   # 当前角色，弹幕可切换
+GIFT_LOG = deque(maxlen=10) # 最近礼物事件（前端特效）
+
+
+def _gift_board_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "gift_board.json")
+
+
+def _load_gift_board():
+    try:
+        with open(_gift_board_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_gift_board():
+    try:
+        with open(_gift_board_path(), "w", encoding="utf-8") as f:
+            json.dump(GIFT_BOARD, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+GIFT_BOARD = _load_gift_board()   # 送礼榜单：从文件恢复，跨重启累计
+
+
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF"      # 主要 emoji 区
+    "\U00002600-\U000027BF"       # 杂项符号 + 装饰符号
+    "\U0001F1E6-\U0001F1FF"       # 旗帜
+    "\U00002B00-\U00002BFF"       # 部分符号
+    "\uFE0F\u200D"                # 变体选择符 + 零宽连接符
+    "]+"
+)
+
+
+def strip_emoji(text):
+    """去掉 emoji（气泡里仍显示，但 TTS 念 emoji 很奇怪，这里只影响朗读文本）。"""
+    return _EMOJI_RE.sub("", text).strip()
+
+
+BLOCK_WORDS = [w.strip() for w in env("BLOCK_WORDS", "").split(",") if w.strip()]
+
+
+def filter_reply(text):
+    """本地敏感词兜底过滤（DeepSeek 自审之外的保险）。"""
+    for w in BLOCK_WORDS:
+        if w:
+            text = text.replace(w, "*" * len(w))
+    return text
 
 
 def say_tts(text, voice):
@@ -84,33 +144,104 @@ def pick_say_voice(content):
     return default, "默认"
 
 
+def user_context(nick):
+    """按昵称取该观众最近几轮对话，让数字人记得「上次和这个人聊过什么」。"""
+    mem = USER_MEMORY.get(nick)
+    if not mem:
+        return ""
+    parts = []
+    for c, r in mem:
+        parts.append(f"他之前说「{c}」，你之前回「{r}」")
+    return "；".join(parts)
+
+
+def try_switch_model(content):
+    """检测换角色命令：命中返回新模型名，否则 None。"""
+    global CURRENT_MODEL
+    text = (content or "").strip()
+    if not text:
+        return None
+    # 明确"换/切"命令 → 轮换下一个
+    if text in ("换角色", "切换角色", "换人", "换皮肤", "换形象", "换模型",
+                "换个角色", "换个形象", "下一个", "下一位"):
+        i = MODELS.index(CURRENT_MODEL)
+        CURRENT_MODEL = MODELS[(i + 1) % len(MODELS)]
+        return CURRENT_MODEL
+    # 含"换/切"关键词 + 角色名 → 切到指定
+    if ("换" in text or "切" in text):
+        for model in MODELS:
+            if model.lower() in text.lower():
+                if model != CURRENT_MODEL:
+                    CURRENT_MODEL = model
+                    return model
+    return None
+
+
+def finish_reply(reply, voice_label, user, content, timings, say_voice=None):
+    """合成语音 + 更新状态 + 入回复队列（chat/gift/speak 共用）。"""
+    global LATEST, LATEST_AUDIO, REPLY_SEQ
+    reply = filter_reply(reply)   # 本地敏感词兜底
+    say_voice = say_voice or env("SAY_VOICE", "Tingting")
+    t0 = time.time()
+    wav_path = say_tts(strip_emoji(reply), say_voice)
+    timings["tts"] = round(time.time() - t0, 2)
+    with LOCK:
+        LATEST_AUDIO = wav_path
+        LATEST.update(status="done", reply=reply, voice=voice_label,
+                      audio_url="", task_id="", video_url="",
+                      local_path=wav_path, timings=timings,
+                      error="", updated_at=time.strftime("%H:%M:%S"))
+    REPLY_SEQ += 1
+    REPLIES.append({"seq": REPLY_SEQ, "user": user, "content": content,
+                    "reply": reply, "voice": voice_label})
+    REPLY_AUDIO[REPLY_SEQ] = wav_path
+
+
 def process_one(item):
-    """在后台线程执行完整链路（local 或 vidu 两种渲染后端）。"""
-    global LATEST, LATEST_AUDIO
-    user, content = item.get("user", ""), item.get("content", "")
+    """在后台线程执行完整链路。item 含 kind: chat(弹幕)/gift(礼物)/speak(直接念)。"""
+    global LATEST, LATEST_AUDIO, REPLY_SEQ
+    kind = item.get("kind", "chat")
+    user = item.get("user", "")
+    content = item.get("content") or item.get("text") or ""
     with LOCK:
         LATEST.update(status="processing", user=user, content=content,
                       reply="", voice="", video_url="", local_path="", error="",
                       updated_at=time.strftime("%H:%M:%S"))
     timings = {}
+
+    # 换角色命令（仅 chat）
+    if kind == "chat":
+        new_model = try_switch_model(content)
+        if new_model:
+            finish_reply(f"好嘞，换到「{new_model}」啦～", "默认", user, content, timings)
+            return
+
     try:
+        # 直接念（进场/关注/点赞/守护/醒目留言等）
+        if kind == "speak":
+            finish_reply(item.get("text", ""), "默认", user, content, timings)
+            return
+
+        # 礼物：累计榜单 + 记录最近礼物
+        if kind == "gift":
+            GIFT_BOARD[user] = GIFT_BOARD.get(user, 0) + item.get("gift_value", 0)
+            GIFT_LOG.append({"nick": user, "item": item.get("gift_item"),
+                             "num": item.get("gift_num"), "value": item.get("gift_value")})
+            _save_gift_board()
+
+        # DeepSeek 回复（chat 和 gift 都走这里）
         t0 = time.time()
-        reply = deepseek_reply(content, nick=user, history=list(HISTORY))
+        reply = deepseek_reply(content, nick=user, history=list(HISTORY),
+                               user_context=user_context(user))
         timings["deepseek"] = round(time.time() - t0, 2)
         HISTORY.append({"role": "user", "content": f"弹幕：{content}"})
         HISTORY.append({"role": "assistant", "content": reply})
+        if user:
+            USER_MEMORY.setdefault(user, deque(maxlen=3)).append((content, reply))
 
         if TTS_BACKEND == "local":
             say_voice, voice_label = pick_say_voice(content)
-            t0 = time.time()
-            wav_path = say_tts(reply, say_voice)
-            timings["tts"] = round(time.time() - t0, 2)
-            with LOCK:
-                LATEST_AUDIO = wav_path
-                LATEST.update(status="done", reply=reply, voice=voice_label,
-                              audio_url="", task_id="", video_url="",
-                              local_path=wav_path, timings=timings,
-                              error="", updated_at=time.strftime("%H:%M:%S"))
+            finish_reply(reply, voice_label, user, content, timings, say_voice=say_voice)
         else:
             voice_id, voice_label = pick_voice(content)
             t0 = time.time()
@@ -138,11 +269,34 @@ def process_one(item):
                               audio_url=audio_url, task_id=task_id, video_url=video_url,
                               local_path=local_path, timings=timings,
                               error="", updated_at=time.strftime("%H:%M:%S"))
+            REPLY_SEQ += 1
+            REPLIES.append({"seq": REPLY_SEQ, "user": user, "content": content,
+                            "reply": reply, "voice": voice_label})
     except Exception as e:  # noqa: BLE001
         with LOCK:
             LATEST.update(status="error", error=str(e), timings=timings,
                           updated_at=time.strftime("%H:%M:%S"))
         traceback.print_exc()
+
+
+def merge_adjacent_gifts(item):
+    """把队列里紧邻的同昵称礼物合并成一条，避免连击重复感谢。"""
+    nick = item.get("user", "")
+    total_num = item.get("gift_num", 1)
+    total_value = item.get("gift_value", 0)
+    parts = [(item.get("gift_item", "礼物"), item.get("gift_num", 1))]
+    with LOCK:
+        while QUEUE and QUEUE[0].get("kind") == "gift" and QUEUE[0].get("user") == nick:
+            g = QUEUE.popleft()
+            total_num += g.get("gift_num", 1)
+            total_value += g.get("gift_value", 0)
+            parts.append((g.get("gift_item", "礼物"), g.get("gift_num", 1)))
+    if len(parts) > 1:
+        item["gift_num"] = total_num
+        item["gift_value"] = total_value
+        summary = "、".join(f"{n}个「{i}」" for i, n in parts)
+        item["content"] = f"观众「{nick}」连送了 {summary}"
+    return item
 
 
 def worker():
@@ -153,25 +307,32 @@ def worker():
         if item is None:
             time.sleep(0.5)
             continue
+        if item.get("kind") == "gift":
+            item = merge_adjacent_gifts(item)
         process_one(item)
         _last_run = time.time()
-        _last_content = item.get("content", "")
+        _last_content = item.get("content") or item.get("text") or ""
 
 
-def enqueue(user, content):
-    global _last_run, _last_content
+def enqueue(item):
+    global _last_run, _last_content, LAST_DANMAKU_TIME
     now = time.time()
     if now - _last_run < MIN_INTERVAL:
         with LOCK:
             LATEST.update(status="done", reply="(限流) 回得太快啦，稍等～")
         return False
-    if content and content == _last_content:
+    key = item.get("content") or item.get("text") or ""
+    if key and key == _last_content:
         return False
     with LOCK:
         if len(QUEUE) >= MAX_QUEUE:
             return False
-        QUEUE.append({"user": user, "content": content})
-        LATEST.update(status="queued", user=user, content=content,
+        if item.get("priority") == "vip":
+            QUEUE.appendleft(item)   # 打赏过的观众弹幕插队
+        else:
+            QUEUE.append(item)
+        LAST_DANMAKU_TIME = now
+        LATEST.update(status="queued", user=item.get("user", ""), content=key,
                       updated_at=time.strftime("%H:%M:%S"))
     return True
 
@@ -243,10 +404,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, AVATAR_HTML, "text/html; charset=utf-8")
         if self.path == "/api/state":
             with LOCK:
-                return self._send(200, dict(LATEST))
+                d = dict(LATEST)
+                d["replies"] = list(REPLIES)
+                d["last_danmaku_at"] = LAST_DANMAKU_TIME
+                d["started_at"] = STARTED_AT
+                d["model"] = CURRENT_MODEL
+                d["gift_board"] = sorted(GIFT_BOARD.items(), key=lambda x: -x[1])[:10]
+                d["gift_log"] = list(GIFT_LOG)
+                return self._send(200, d)
         if self.path.startswith("/audio"):
-            with LOCK:
-                p = LATEST_AUDIO
+            p = None
+            if "seq=" in self.path:
+                try:
+                    seq = int(self.path.split("seq=")[1].split("&")[0])
+                    p = REPLY_AUDIO.get(seq)
+                except Exception:
+                    p = None
+            if not p:
+                with LOCK:
+                    p = LATEST_AUDIO
             if p and os.path.exists(p):
                 with open(p, "rb") as f:
                     return self._send(200, f.read(), "audio/wav")
@@ -284,13 +460,30 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(self.rfile.read(n) or b"{}")
             except Exception:
                 return self._send(400, {"error": "bad json"})
-            content = (body.get("content") or "").strip()
-            # 兼容两种来源：手动 curl 用 user；赛博小雅 reader 用 nick
-            user = (body.get("user") or body.get("nick") or "").strip()
-            if not content:
+            kind = (body.get("kind") or "").strip()
+            priority = (body.get("priority") or "normal").strip()
+            if kind == "gift":
+                nick = (body.get("nick") or body.get("say_nick") or "").strip()
+                num = int(body.get("gift_num") or 1)
+                itm = (body.get("gift_item") or "礼物").strip()
+                item = {
+                    "kind": "gift", "user": nick, "priority": priority,
+                    "gift_item": itm, "gift_num": num,
+                    "gift_value": int(body.get("gift_value") or 0),
+                    "content": f"观众「{nick or '神秘人'}」送了 {num} 个「{itm}」",
+                }
+            elif (body.get("content") or "").strip():
+                item = {
+                    "kind": "chat", "priority": priority,
+                    "user": (body.get("user") or body.get("nick") or "").strip(),
+                    "content": (body.get("content") or "").strip(),
+                }
+            elif (body.get("text") or "").strip():
+                item = {"kind": "speak", "user": "", "priority": priority,
+                        "text": (body.get("text") or "").strip()}
+            else:
                 return self._send(400, {"error": "content required"})
-            ok = enqueue(user, content)
-            # 兼容 reader.py 期望的 queued/depth 字段
+            ok = enqueue(item)
             return self._send(200, {"queued": ok, "depth": len(QUEUE),
                                     "status": "queued" if ok else "skipped"})
         return self._send(404, {"error": "not found"})
