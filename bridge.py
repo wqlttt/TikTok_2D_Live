@@ -90,6 +90,23 @@ def _save_gift_board():
 
 GIFT_BOARD = _load_gift_board()   # 送礼榜单：从文件恢复，跨重启累计
 
+MAX_AUDIO_KEEP = int(env("MAX_AUDIO_KEEP", "50") or 50)   # 最多保留最近 N 条音频文件
+
+
+def _cleanup_audio():
+    """删除超出保留范围的旧音频文件，防止磁盘无限累积。"""
+    if REPLY_SEQ <= MAX_AUDIO_KEEP:
+        return
+    cutoff = REPLY_SEQ - MAX_AUDIO_KEEP
+    for seq in list(REPLY_AUDIO):
+        if seq <= cutoff:
+            p = REPLY_AUDIO.pop(seq, None)
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
 
 _EMOJI_RE = re.compile(
     "[\U0001F000-\U0001FAFF"      # 主要 emoji 区
@@ -195,6 +212,7 @@ def finish_reply(reply, voice_label, user, content, timings, say_voice=None):
     REPLIES.append({"seq": REPLY_SEQ, "user": user, "content": content,
                     "reply": reply, "voice": voice_label})
     REPLY_AUDIO[REPLY_SEQ] = wav_path
+    _cleanup_audio()
 
 
 def process_one(item):
