@@ -1,0 +1,71 @@
+# =====================================================================
+# AI 数字人直播 · 主配置示例（Mac Mini / Apple Silicon）
+# 字段为“蓝本”通用映射，实际项目请以 cyber-xiaoya-live 仓库 README 为准。
+# =====================================================================
+
+# ---------------- 1. 大模型：DeepSeek ----------------
+deepseek:
+  api_key: "sk-xxxxxxxx"            # 环境变量 DEEPSEEK_API_KEY
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"            # deepseek-chat(快) / deepseek-reasoner(慢)
+  temperature: 0.8
+  max_tokens: 80                    # 直播回复要短，避免拖长链
+  # 人设提示词：见 ../config/persona_prompt.md，或直接内联
+  system_prompt: "你是赛博小雅，一个元气、可爱、反应快的主播。回复要口语化、简短，30~80字，适当带语气词和表情。"
+
+# ---------------- 2. TTS 引擎 ----------------
+# backend 三选一：local(fireredtts3-onnx) | vidu_tts(云端) | edge_tts(免费云端)
+tts:
+  backend: "vidu_tts"               # 原型阶段推荐云端，省去音频公网托管
+  # --- vidu_tts 参数 ---
+  vidu_tts:
+    voice_id: "your_voice_id"       # Vidu 音色列表，需查官方文档确认取值
+    speed: 1.0                      # 0.5~2
+    volume: 0                       # 0~10，0=正常
+    pitch: 0                        # -12~12
+  # --- edge_tts 参数 ---
+  edge_tts:
+    voice: "zh-CN-XiaoxiaoNeural"
+  # --- local(fireredtts3-onnx) 参数 ---
+  local:
+    model_dir: "/path/to/fireredtts3/model"
+    sample_rate: 16000              # 输出采样率，喂渲染前统一转 16k 单声道 wav
+
+# ---------------- 3. 云端渲染：Vidu ----------------
+# 两条路径：
+#   A 实时(S2-Avatar, 首选, 正式直播): 参数在 vidu-stream portal，需查官方文档
+#   B 离线对口型(lip-sync, 文档齐全, 原型验证): 下面参数已核对官方文档
+vidu:
+  api_key: "xxxxxxxx"               # 环境变量 VIDU_API_KEY
+  base_url: "https://api.vidu.cn"
+
+  # --- 路径 B：对口型 lip-sync ---
+  lip_sync:
+    endpoint: "/ent/v2/lip-sync"
+    video_url: "https://your-storage/avatar_base.mp4"   # 数字人底片(公网 URL)
+    # audio_url 由 TTS 环节动态传入；格式 wav/mp3/m4a/aac/ogg, 1~600s, ≤100MB
+    audio_format: "mp3"             # 上传/引用音频格式
+    poll_interval_sec: 5            # 轮询间隔
+    poll_timeout_sec: 600           # 轮询超时
+    # 返回：task_id -> GET /ent/v2/tasks/{id}/creations -> creations[0].url(24h 有效)
+
+  # --- 路径 A：实时 S2-Avatar(需查官方文档确认鉴权/流协议) ---
+  s2_avatar:
+    endpoint: "见 https://platform.vidu.cn/vidu-stream/doc/s2-avatar/realtime/quick-start"
+
+# ---------------- 4. 弹幕监听 ----------------
+danmaku:
+  # 采集器 cyber-xiaoya-danmaku，推送到本机数字人桥
+  bridge_url: "http://127.0.0.1:8000/api/danmaku"
+  platform: "douyin"                # douyin / bilibili / youtube / shipinhao
+  room_url: "https://live.douyin.com/你的直播间号"   # 直播间地址
+  cookie: ""                        # 抖音网页 cookie(签名失效时更新)
+
+# ---------------- 5. 编排器(数字人桥) ----------------
+bridge:
+  host: "127.0.0.1"
+  port: 8000
+  # 限流：防止弹幕刷屏打爆 API
+  max_queue: 20
+  min_interval_sec: 3               # 两条回复最小间隔
+  dedup_window_sec: 10              # 相同弹幕去重窗口

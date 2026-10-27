@@ -1,0 +1,22 @@
+# ============ 敏感配置：绝不提交 ============
+# 含 API Key / Token / Cookie / 房间号
+.env
+douyinLive/config.yaml
+cyber-xiaoya-danmaku/config.json
+
+# ============ 第三方仓库：各自独立 clone（见 README）============
+/cyber-xiaoya-danmaku/
+/douyinLive/
+/live2d_samples/
+
+# ============ 运行时产物 ============
+/audio/
+/output/
+__pycache__/
+*.pyc
+*.pyo
+logs/
+*.log
+
+# ============ macOS ============
+.DS_Store

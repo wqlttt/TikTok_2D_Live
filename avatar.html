@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>赛博小雅 · Live2D 虚拟人</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:transparent;}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;
+       font-family:-apple-system,"PingFang SC",sans-serif;}
+  #stage{position:relative;width:min(72vh,92vw);aspect-ratio:400/520;}
+  #stage::before{content:"";position:absolute;inset:0;border-radius:24px;
+    background:radial-gradient(circle at 50% 30%,#fff6ef 0%,#ffe3ee 52%,#ffcfe0 100%);
+    box-shadow:0 18px 60px rgba(0,0,0,.18);}
+  #l2d{position:absolute;inset:0;width:100%;height:100%;}
+  #l2d-status{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);
+    text-align:center;color:#b0556b;font-size:14px;padding:0 16px;}
+  #subtitle{position:relative;margin-top:14px;max-width:80vw;min-height:1.4em;
+    font-size:20px;color:#5b3b4a;text-align:center;text-shadow:0 1px 0 #fff;
+    padding:6px 18px;border-radius:999px;background:rgba(255,255,255,.7);}
+  #subtitle:empty{display:none;}
+  #danmaku-layer{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:5;}
+  .danmaku{position:absolute;left:100%;white-space:nowrap;font-size:20px;font-weight:600;
+    color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.55),0 0 8px rgba(0,0,0,.3);
+    animation:danmaku-move 9s linear forwards;}
+  @keyframes danmaku-move{to{transform:translateX(-130vw);}}
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="l2d"></canvas>
+    <div id="l2d-status">正在加载模型…</div>
+    <div id="danmaku-layer"></div>
+  </div>
+  <div id="subtitle"></div>
+
+<script src="/live2d/pixi.min.js"></script>
+<script src="/live2d/live2dcubismcore.min.js"></script>
+<script src="/live2d/cubism4.min.js"></script>
+<script>
+(function(){
+  "use strict";
+  var W = 800, H = 1040;           // 内部渲染分辨率（2x，更清晰）
+  var app = null, model = null, coreModel = null, motionManager = null;
+  var subtitle = document.getElementById("subtitle");
+  var statusEl = document.getElementById("l2d-status");
+
+  var currentOpen = 0, targetOpen = 0;
+  var speaking = false;
+  var lastReply = "", lastDanmaku = "";
+  var audioCtx = null, analyser = null;
+
+  function setOpenness(o){ targetOpen = o; }
+
+  async function init(){
+    try {
+      app = new PIXI.Application({
+        view: document.getElementById("l2d"),
+        transparent: true,
+        width: W, height: H,
+        backgroundAlpha: 0
+      });
+      model = await PIXI.live2d.Live2DModel.from(
+        "/live2d/Hiyori/Hiyori.model3.json",
+        { motionPreload: "IDLE", idleMotionGroup: "None" }
+      );
+      app.stage.addChild(model);
+
+      // 居中 + 适配（Hiyori 画布近似正方形，按高度填满再略放大）
+      model.anchor.set(0.5, 0.5);
+      var s = Math.min(W / model.width, H / model.height) * 1.12;
+      model.scale.set(s);
+      model.x = W / 2;
+      model.y = H / 2;
+
+      coreModel = model.internalModel.coreModel;
+      motionManager = model.internalModel.motionManager;
+      // 注意：自动 Idle 动作会驱动嘴部(ParamMouthOpenY)，和音频口型冲突，
+      // 已在上面通过 idleMotionGroup:"None" 关闭；眨眼/呼吸由内置组件自动处理。
+      statusEl.style.display = "none";
+    } catch(e){
+      statusEl.textContent = "模型加载失败：" + (e && e.message ? e.message : e);
+      console.error("Live2D init failed:", e);
+    }
+  }
+
+  // 主循环：口型平滑 + 写入 Live2D 参数
+  var t0 = performance.now();
+  function loop(){
+    currentOpen += (targetOpen - currentOpen) * 0.3;
+    if (coreModel) {
+      coreModel.setParameterValueById("ParamMouthOpenY", currentOpen);
+    }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  function ensureAudio(){
+    if (!audioCtx){
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  }
+
+  async function playAndAnimate(){
+    try {
+      ensureAudio();
+      var resp = await fetch("/audio?t=" + Date.now());
+      if (!resp.ok) return;
+      var buf = await resp.arrayBuffer();
+      var audioBuf = await audioCtx.decodeAudioData(buf);
+      var src = audioCtx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(analyser);
+
+      var data = new Uint8Array(analyser.fftSize);
+      speaking = true;
+      function drive(){
+        if (!speaking) return;
+        analyser.getByteTimeDomainData(data);
+        var sum = 0;
+        for (var i = 0; i < data.length; i++){
+          var v = (data[i] - 128) / 128;
+          sum += v * v;
+        }
+        var rms = Math.sqrt(sum / data.length);
+        setOpenness(Math.min(1, rms * 5));
+        requestAnimationFrame(drive);
+      }
+      src.onended = function(){ speaking = false; setOpenness(0); };
+      src.start();
+      drive();
+    } catch(e){
+      console.warn("audio play blocked:", e);
+    }
+  }
+
+  function spawnDanmaku(text){
+    var layer = document.getElementById("danmaku-layer");
+    var el = document.createElement("div");
+    el.className = "danmaku";
+    el.textContent = text;
+    el.style.top = (4 + Math.random() * 30) + "%";
+    layer.appendChild(el);
+    el.addEventListener("animationend", function(){ el.remove(); });
+    while (layer.children.length > 40) layer.firstChild.remove();
+  }
+
+  async function poll(){
+    try {
+      var r = await fetch("/api/state");
+      var s = await r.json();
+      subtitle.textContent = s.reply || "";
+      if (s.reply && s.reply !== lastReply){
+        lastReply = s.reply;
+        playAndAnimate();
+      }
+      if (s.content && s.content !== lastDanmaku){
+        lastDanmaku = s.content;
+        var who = s.user || "";
+        spawnDanmaku(who ? (who + "：" + s.content) : s.content);
+      }
+    } catch(e){}
+  }
+
+  document.addEventListener("pointerdown", function(){ ensureAudio(); });
+  setInterval(poll, 1500);
+  poll();
+  init();
+})();
+</script>
+</body>
+</html>
