@@ -39,6 +39,7 @@
 ├── verify_pipeline.py   # 最小验证脚本（一次性走通链路 + 延迟统计）
 ├── avatar.html          # Live2D 播放器（渲染 + 口型 + 弹幕飘屏 + 字幕）
 ├── setup.sh             # 一键部署脚本（下载运行库/模型/弹幕依赖）
+├── setup_piper.sh       # 可选：安装本地 Piper TTS（音质好）
 ├── config/
 │   ├── config.example.yaml   # 主配置模板
 │   └── persona_prompt.md     # DeepSeek 人设提示词
@@ -152,13 +153,21 @@ cd cyber-xiaoya-danmaku && python reader.py                  # ③ 弹幕转发
 
 ## 配置速查
 
+### 本地 TTS：Piper（推荐，音质好）
+
+```bash
+bash setup_piper.sh   # 安装 piper-tts + 下载音色(小雅) + g2pw 模型(~280MB)
+```
+
+> 脚本会自动把 `TTS_BACKEND=piper` 写入 `.env`。若嫌模型大，用 `say`（`TTS_BACKEND=local`）即可。
+
 | 变量 | 说明 |
 |---|---|
 | `DEEPSEEK_API_KEY` | DeepSeek API Key（必填） |
 | `DEEPSEEK_MODEL` | `deepseek-chat`（快）/ `deepseek-reasoner`（慢） |
 | `DEEPSEEK_MAX_TOKENS` / `DEEPSEEK_TEMPERATURE` | 回复长度 / 随机性 |
 | `HISTORY_TURNS` | 记忆轮数（默认 8） |
-| `TTS_BACKEND` | `local`（macOS say）/ `vidu`（云端对口型，可选） |
+| `TTS_BACKEND` | `piper`（本地 Piper，音质好）/ `local`（macOS say）/ `vidu`（云端对口型） |
 | `SAY_VOICE` | macOS `say` 音色（默认 `Tingting`） |
 | `SAY_VOICE_MAP` | 弹幕关键词→音色（JSON） |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | 桥监听地址/端口 |
