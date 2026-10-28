@@ -124,7 +124,8 @@
       motionManager = model.internalModel.motionManager;
       if (typeof GiftPlayer === "function") {
         if (!giftPlayer) {
-          giftPlayer = new GiftPlayer({ model: model, stage: document.getElementById("stage") });
+          giftPlayer = new GiftPlayer({ model: model, stage: document.getElementById("stage"),
+                                        onFinish: function(){ pumpActions(); } });
         } else {
           giftPlayer.setModel(model, document.getElementById("stage"));
         }
@@ -364,9 +365,25 @@
     statusText.textContent = text;
   }
 
+  // 前端动作队列：服务端按时长串行发布，但前端开播会比服务端晚一个轮询周期，
+  // 下一条到达时上一条可能还没播完——排队而不是直接 stop()，避免截掉尾巴。
+  var pendingActions = [];
+  var MAX_PENDING_ACTIONS = 5;
+  function playAction(act){
+    try {
+      giftPlayer.play(act);
+    } catch (err) {
+      console.warn("[avatar] gift action failed:", err);
+    }
+  }
+  function pumpActions(){
+    if (!giftPlayer || giftPlayer.isActive() || !pendingActions.length) return;
+    playAction(pendingActions.shift());
+  }
+
   async function poll(){
     try {
-      var r = await fetch("/api/state");
+      var r = await fetch("/api/state" + (actionInit ? "?since=" + lastActionSeq : ""));
       var s = await r.json();
       updateStatus(s);
       if (s.gift_board) updateGiftBoard(s.gift_board);
@@ -383,19 +400,21 @@
           actionInit = true;
           lastActionSeq = serverSeq;
         } else {
-          var newest = null;
-          for (var ai = 0; ai < s.actions.length; ai++) {
-            var act = s.actions[ai];
-            if (Number(act.seq) > lastActionSeq) newest = act;
-          }
-          if (newest) {
-            lastActionSeq = Number(newest.seq) || lastActionSeq;
-            try {
-              giftPlayer.play(newest);
-            } catch (err) {
-              console.warn("[avatar] gift action failed:", err);
+          // 按 seq 顺序消费所有新动作：普通动作排队，带 interrupt 的立即打断。
+          // 不能只播最新一条——一次轮询窗口里可能有多条，旧的会被静默跳过。
+          var fresh = s.actions.filter(function(a){ return Number(a.seq) > lastActionSeq; })
+            .sort(function(a, b){ return Number(a.seq) - Number(b.seq); });
+          fresh.forEach(function(act){
+            lastActionSeq = Math.max(lastActionSeq, Number(act.seq) || 0);
+            if (act.interrupt) {
+              pendingActions = [];
+              playAction(act);
+            } else {
+              pendingActions.push(act);
+              if (pendingActions.length > MAX_PENDING_ACTIONS) pendingActions.shift();
             }
-          }
+          });
+          pumpActions();
         }
       }
       if (s.content && s.content !== lastDanmaku){
@@ -419,7 +438,7 @@
       if (audioCtx && audioCtx.state === "running") startHint.style.display = "none";
     } catch(e){}
   }, 800);
-  setInterval(poll, 300);
+  setInterval(poll, 500);
   poll();
   init();
 })();

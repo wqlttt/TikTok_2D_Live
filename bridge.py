@@ -497,7 +497,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/avatar"):
             return self._send(200, AVATAR_HTML, "text/html; charset=utf-8")
-        if self.path == "/api/state":
+        if self.path.split("?", 1)[0] == "/api/state":
+            # ?since=<action_seq>：只返回该序号之后的动作，前端高频轮询时减小负载。
+            # 不传则返回全部最近动作（兼容旧调用方）。
+            since = 0
+            m = re.search(r"[?&]since=(\d+)", self.path)
+            if m:
+                since = int(m.group(1))
             with LOCK:
                 d = dict(LATEST)
                 d["replies"] = list(REPLIES)
@@ -506,7 +512,7 @@ class Handler(BaseHTTPRequestHandler):
                 d["model"] = CURRENT_MODEL
                 d["gift_board"] = sorted(GIFT_BOARD.items(), key=lambda x: -x[1])[:10]
                 d["gift_log"] = list(GIFT_LOG)
-                d["actions"] = list(ACTION_LOG)
+                d["actions"] = [a for a in ACTION_LOG if a.get("seq", 0) > since]
                 d["action_seq"] = ACTION_SEQ
                 d["director"] = DIRECTOR.snapshot()
                 return self._send(200, d)
@@ -542,11 +548,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(403, {"error": "forbidden"})
             if os.path.isfile(full):
                 if full.endswith(".js"):
-                    ct = "application/javascript"
+                    ct = "application/javascript; charset=utf-8"
                 elif full.endswith(".css"):
-                    ct = "text/css"
+                    ct = "text/css; charset=utf-8"
                 elif full.endswith(".json"):
-                    ct = "application/json"
+                    ct = "application/json; charset=utf-8"
                 elif full.endswith(".png"):
                     ct = "image/png"
                 elif full.endswith(".webm"):
