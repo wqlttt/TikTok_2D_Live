@@ -29,6 +29,8 @@
 - **DeepSeek 回复**：可配人设提示词，带最近 8 轮对话记忆 + 观众昵称点名
 - **本地 TTS**：macOS 自带 `say`，零依赖（可替换 fireredtts3-onnx）
 - **Live2D Cubism 4**：官方示例模型 Hiyori，音频实时驱动口型，内置自动眨眼/呼吸/头发物理
+- **礼物互动（最小闭环）**：礼物事件 → 规则导演 → Live2D 动作 / 特效 / 礼物浮层；支持优先级、冷却、打断、排队
+- **大礼物纯特效演出**：使用开源 [canvas-confetti](https://github.com/catdad/canvas-confetti) 做烟花/彩带/玫瑰雨，不占用 Live2D 动作组
 - **弹幕飘屏** + 回复字幕
 - **OBS 浏览器源**接入，无需推流码
 
@@ -36,13 +38,26 @@
 
 ```
 ├── bridge.py            # 数字人桥：/api/danmaku 收弹幕 → DeepSeek → TTS → 状态/音频服务
+├── director.py          # 礼物导演：规则匹配 / 优先级 / 冷却 / 打断 / 队列
+├── inspect_live2d.py    # 查看模型的动作组/下标/表情
 ├── verify_pipeline.py   # 最小验证脚本（一次性走通链路 + 延迟统计）
 ├── avatar.html          # Live2D 播放器（渲染 + 口型 + 弹幕飘屏 + 字幕）
-├── setup.sh             # 一键部署脚本（下载运行库/模型/弹幕依赖）
-├── setup_piper.sh       # 可选：安装本地 Piper TTS（音质好）
+├── static/
+│   ├── gift-effects.js  # 礼物特效（优先 canvas-confetti，CSS 兜底）
+│   ├── gift-effects.css
+│   ├── gift-player.js   # ActionPlan 播放器（时间轴 → motion/effect/video/toast）
+│   ├── videos/          # 大礼物预渲染视频（可选）
+│   └── vendor/
+│       ├── confetti.browser.js    # canvas-confetti 1.9.3
+│       └── canvas-confetti.LICENSE
 ├── config/
 │   ├── config.example.yaml   # 主配置模板
+│   ├── gift_actions.json     # 礼物 → 演出规则
 │   └── persona_prompt.md     # DeepSeek 人设提示词
+├── tests/
+│   └── test_director.py      # 导演规则单测
+├── setup.sh             # 一键部署脚本（下载运行库/模型/弹幕依赖）
+├── setup_piper.sh       # 可选：安装本地 Piper TTS（音质好）
 ├── patches/winsound.py       # macOS 兼容补丁（见下）
 ├── live2d/                   # Live2D 模型与运行库（本地已就绪）
 │   ├── pixi.min.js           #   PixiJS v6
@@ -151,6 +166,127 @@ cd cyber-xiaoya-danmaku && python reader.py                  # ③ 弹幕转发
 
 > 声音回传可用 BlackHole 虚拟声卡（`brew install blackhole-2ch`）。
 
+## 礼物互动（最小闭环）
+
+礼物和普通弹幕走**两条并行链路**，这是关键：
+
+```text
+礼物事件
+  ├─→ GiftDirector（立即）→ ActionPlan → avatar.html 播动作/特效/浮层
+  └─→ DeepSeek + TTS（异步）→ 台词音频 → 字幕 + 口型
+```
+
+也就是说：礼物到达先让宠物“有反应”，不等 DeepSeek/TTS；感谢话术随后再由现有链路补上。
+
+### 测试一条礼物
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/danmaku \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"gift","nick":"测试观众","gift_item":"玫瑰","gift_num":1,"gift_value":1}'
+```
+
+`/api/state` 会多出：
+
+- `actions`：最近动作列表
+- `action_seq`：动作序号，前端只播新动作
+- `director`：当前演出 / 队列长度 / 规则数
+
+### 规则配置
+
+编辑 [`config/gift_actions.json`](config/gift_actions.json)，默认有 6 条：
+
+| 规则 | 匹配 | 效果 |
+|---|---|---|
+| `large_gift` | `value >= 100` | canvas-confetti 烟花 + 彩带 + 浮层，5 秒，不可打断；**不使用 Live2D 动作组** |
+| `combo_10` | `combo >= 10` | 玫瑰雨 + 连击浮层 |
+| `medium_gift` | `10 <= value <= 99` | 爱心 + 组合动作 |
+| `heart_gift` | 名字含“小心心/爱心”且 `value <= 9` | 爱心 + 专属浮层 |
+| `small_gift` | `value <= 9` | 星星 + 微反应 |
+| `fallback` | 兜底 | 星星 + 感谢浮层 |
+
+匹配按 `priority` 从高到低；`cooldown` / `user_cooldown` 控制频率；`interruptible` 控制能否被更大礼物打断。
+
+`match` 支持：`names` / `exclude_names`（礼物名包含匹配）、`min_value` / `max_value`、`min_count` / `max_count`、`min_combo` / `max_combo`。
+
+### 大礼物为什么不占 Live2D 动作组
+
+大礼物用的是 `canvas-confetti` 的粒子特效，画布固定覆盖整个 OBS 浏览器源，不新增 Live2D motion。这样做的好处：
+
+- 不需要为每个大礼物做一套 Live2D 动作，素材成本低
+- 烟花/彩带/玫瑰雨的表现力比单个骨骼动作更强
+- 大礼物播放时，Live2D 仍可继续待机/眨眼，不会冻结 5 秒
+- 想换成预渲染视频时，时间轴直接加 `video` step，不需要改导演
+
+当前大礼物的 `timeline` 只有 `effect` + `toast`，没有 `motion`；`GiftPlayer` 只有在时间轴包含 `motion` 时才暂停程序化待机手势。
+
+大礼物也可以改成视频：
+
+```json
+{
+  "at": 0,
+  "type": "video",
+  "src": "/static/videos/large_gift.webm",
+  "duration": 5.0,
+  "audio": false,
+  "fit": "contain",
+  "loop": false
+}
+```
+
+视频放 [static/videos/](TikTok_2D_Live/static/videos/)，建议用 WebM + VP9 alpha 做透明背景；不透明视频用 MP4/H.264 也可以。`audio: false` 时静音，避免和主播/TTS 抢声音。
+
+### ActionPlan 时间轴
+
+导演输出的是与渲染器无关的 JSON：
+
+```json
+{
+  "duration": 3.2,
+  "timeline": [
+    {"at": 0, "type": "motion", "group": "TapBody", "index": 0},
+    {"at": 0.1, "type": "effect", "name": "hearts", "duration": 2.2},
+    {"at": 0.2, "type": "toast", "text": "谢谢 {nick} 的 {gift}！", "duration": 2.6}
+  ]
+}
+```
+
+`at` 是相对动作开始的秒数，步骤可以并行，所以“复杂活动”可以写成一条时间轴，而不是一串 `if/else`。
+
+### 扩展点
+
+- **加礼物规则**：只改 `config/gift_actions.json`，不改 Python。
+- **加特效**：优先在 `static/gift-effects.js` 的 `spawnWithConfetti()` 里加一个 `case`；需要离线兜底再补 `spawn()` 的 CSS 分支。
+- **加步骤类型**：在 `static/gift-player.js` 的 `_exec()` 里加一个 `case`；未知类型会派发 `gift:step` 事件，方便外挂。
+- **换视频演出**：把 `effect` step 换成 `video` step，文件放 `static/videos/`，支持 `fit` / `loop` / `audio`。
+- **换渲染器**：任何能消费 `ActionPlan` 的运行时都可以接，不限于 Live2D。
+- **改规则后**：当前版本重启 `bridge.py` 生效；`GiftDirector.reload()` 已预留，可后续接文件监听/后台热更新。
+- **跑测试**：`python -m unittest discover -s tests -v`（只依赖标准库）。
+
+> `gift_value` 口径：当前按 bridge 收到的字段直接匹配。如果 `reader.py` 传的是“单价”而不是“总价”，高价值礼物的 `value` 规则会偏小；请在采集侧乘 `gift_num`，或在 `director.py` 里统一换算。
+>
+> Live2D 动作组因模型而异。Hiyori 官方模型只有 `Idle`（9 个）和 `TapBody`（1 个，下标 0），所以默认配置全部用 `TapBody[0]`；不同礼物靠特效/浮层区分。换模型后先运行 `python inspect_live2d.py`，再按输出改配置里的 `group` / `index`。如果组不存在，motion 会静默失败，但特效和浮层仍会播放。
+
+### 模块边界与失败降级
+
+| 模块 | 文件 | 职责 |
+|---|---|---|
+| 规则/调度 | `director.py` | 匹配、优先级、冷却、打断、队列；不碰渲染 |
+| 接入/发布 | `bridge.py` | 收礼物、发布 ActionPlan、后台 tick；不碰具体特效 |
+| 时间轴播放 | `static/gift-player.js` | 消费 ActionPlan，调度 motion/effect/video/toast |
+| 粒子/浮层 | `static/gift-effects.js` | canvas-confetti 粒子、CSS 兜底、视频 overlay |
+| 规则配置 | `config/gift_actions.json` | 运营可改的礼物→演出映射 |
+| 视频素材 | `static/videos/` | 大礼物 WebM/MP4 |
+
+失败降级：
+
+- `GiftDirector` 配置读取失败：保留旧规则，`/api/state.director.last_error` 可查
+- 导演处理异常：不影响礼物进入原来的 DeepSeek/TTS 感谢链路
+- `canvas-confetti` 加载失败：自动回退到 `gift-effects.js` 的 CSS 特效
+- Live2D 动作组不存在：motion 静默失败，特效/浮层继续
+- 视频加载失败：打印 `[GiftEffects] video failed`，按 `duration` 自动清理
+- 前端动作播放异常：`GiftPlayer` 捕获单个 step 的异常，不阻塞后续动作
+
 ## 配置速查
 
 ### 本地 TTS：Piper（推荐，音质好）
@@ -180,11 +316,22 @@ bash setup_piper.sh   # 安装 piper-tts + 下载音色(小雅) + g2pw 模型(~2
 PIXI.live2d.Live2DModel.from("/live2d/你的模型/model3.json", ...)
 ```
 
+换完模型后先看它到底有哪些动作组和下标：
+
+```bash
+python inspect_live2d.py
+# 或只看某个模型
+python inspect_live2d.py Hiyori
+```
+
+然后把 `config/gift_actions.json` 里的 `"group": "TapBody", "index": 0` 改成实际存在的组/下标。不同模型的组名和数量完全不同，不能直接照搬 Hiyori。
+
 ## 许可与致谢
 
 - 本项目代码：MIT
 - Live2D 模型（Hiyori）：Live2D Inc. 官方示例模型，遵循 Live2D 许可
 - PixiJS：MIT · pixi-live2d-display：MIT · Live2D Cubism Core：Live2D Inc.
+- 大礼物粒子特效：[canvas-confetti](https://github.com/catdad/canvas-confetti)，ISC License，见 `static/vendor/canvas-confetti.LICENSE`
 - 弹幕采集依赖：[douyinLive](https://github.com/jwwsjlm/douyinLive)、[cyber-xiaoya-danmaku](https://github.com/cyber-xiaoya/cyber-xiaoya-danmaku)（各自遵循其许可证）
 
 > ⚠️ 请遵守各平台用户协议，控制抓取频率，勿用于违规用途。

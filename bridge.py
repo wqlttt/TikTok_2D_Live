@@ -4,8 +4,9 @@
 最小可运行的本地「数字人桥」服务（仅用标准库，conda `usually` 环境零新依赖）。
 
 功能：
-  POST /api/danmaku   收弹幕 -> 入队 -> 后台走链路(DeepSeek -> TTS -> Vidu 对口型)
-  GET  /api/state     查最新一条处理结果（含各阶段耗时）
+  POST /api/danmaku   收弹幕/礼物 -> 入队 -> 后台走链路(DeepSeek -> TTS -> Vidu 对口型)
+                      礼物额外先走 GiftDirector，立即产出 Live2D 动作/特效
+  GET  /api/state     查最新一条处理结果（含各阶段耗时、礼物动作）
   GET  /video         播放最新渲染视频文件
   GET  /              预览页（自动轮询并播放最新视频）
 
@@ -37,6 +38,7 @@ from verify_pipeline import (
     vidu_lipsync_wait,
     vidu_tts,
 )
+from director import GiftDirector
 
 HOST = env("BRIDGE_HOST", "127.0.0.1")
 PORT = int(env("BRIDGE_PORT", "8000") or 8000)
@@ -64,7 +66,10 @@ STARTED_AT = time.time()   # 桥启动时间(epoch)
 LAST_DANMAKU_TIME = None   # 上次收到弹幕的时间戳(epoch)，用于前端"是否在线"提示
 MODELS = ["Hiyori", "Haru", "Mao", "Natori", "Ren", "Rice", "Mark", "Wanko"]
 CURRENT_MODEL = "Hiyori"   # 当前角色，弹幕可切换
-GIFT_LOG = deque(maxlen=10) # 最近礼物事件（前端特效）
+GIFT_LOG = deque(maxlen=10) # 最近礼物事件（前端礼物榜/调试）
+DIRECTOR = GiftDirector()  # 礼物规则导演：事件 -> ActionPlan
+ACTION_SEQ = 0             # 动作序号，前端据此只播放新动作
+ACTION_LOG = deque(maxlen=20)  # 最近动作，供前端补播/排查
 
 
 def _gift_board_path():
@@ -106,6 +111,19 @@ def _cleanup_audio():
                     os.remove(p)
                 except Exception:
                     pass
+
+
+def publish_action(plan):
+    """给导演产出的 ActionPlan 编序号，并放进最近动作队列。"""
+    global ACTION_SEQ
+    if not plan:
+        return None
+    with LOCK:
+        ACTION_SEQ += 1
+        action = dict(plan)
+        action["seq"] = ACTION_SEQ
+        ACTION_LOG.append(action)
+    return action
 
 
 _EMOJI_RE = re.compile(
@@ -380,6 +398,16 @@ def worker():
         _last_content = item.get("content") or item.get("text") or ""
 
 
+def director_tick_loop():
+    """后台推进礼物队列：当前演出结束后自动播下一个。"""
+    while True:
+        try:
+            publish_action(DIRECTOR.tick())
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        time.sleep(0.2)
+
+
 def enqueue(item):
     global _last_run, _last_content, LAST_DANMAKU_TIME
     now = time.time()
@@ -407,6 +435,7 @@ _here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(_here, "avatar.html"), encoding="utf-8") as _f:
     AVATAR_HTML = _f.read()
 LIVE2D_DIR = os.path.join(_here, "live2d")
+STATIC_DIR = os.path.join(_here, "static")
 
 
 PREVIEW_HTML = """<!doctype html>
@@ -477,6 +506,9 @@ class Handler(BaseHTTPRequestHandler):
                 d["model"] = CURRENT_MODEL
                 d["gift_board"] = sorted(GIFT_BOARD.items(), key=lambda x: -x[1])[:10]
                 d["gift_log"] = list(GIFT_LOG)
+                d["actions"] = list(ACTION_LOG)
+                d["action_seq"] = ACTION_SEQ
+                d["director"] = DIRECTOR.snapshot()
                 return self._send(200, d)
         if self.path.startswith("/audio"):
             p = None
@@ -500,6 +532,32 @@ class Handler(BaseHTTPRequestHandler):
                 with open(p, "rb") as f:
                     return self._send(200, f.read(), "video/mp4")
             return self._send(404, {"error": "no video yet"})
+        # 静态资源：礼物播放器、特效库、预渲染视频。
+        # 只允许 static/ 下的真实文件，防止 ../ 路径穿越。
+        if self.path.startswith("/static/"):
+            rel = self.path[len("/static/"):].split("?")[0]
+            full = os.path.realpath(os.path.join(STATIC_DIR, rel))
+            root = os.path.realpath(STATIC_DIR)
+            if not full.startswith(root + os.sep):
+                return self._send(403, {"error": "forbidden"})
+            if os.path.isfile(full):
+                if full.endswith(".js"):
+                    ct = "application/javascript"
+                elif full.endswith(".css"):
+                    ct = "text/css"
+                elif full.endswith(".json"):
+                    ct = "application/json"
+                elif full.endswith(".png"):
+                    ct = "image/png"
+                elif full.endswith(".webm"):
+                    ct = "video/webm"
+                elif full.endswith(".mp4"):
+                    ct = "video/mp4"
+                else:
+                    ct = "application/octet-stream"
+                with open(full, "rb") as f:
+                    return self._send(200, f.read(), ct)
+            return self._send(404, {"error": "not found"})
         if self.path.startswith("/live2d/"):
             rel = self.path[len("/live2d/"):].split("?")[0]
             full = os.path.realpath(os.path.join(LIVE2D_DIR, rel))
@@ -528,14 +586,37 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "bad json"})
             kind = (body.get("kind") or "").strip()
             priority = (body.get("priority") or "normal").strip()
+            action = None
             if kind == "gift":
                 nick = (body.get("nick") or body.get("say_nick") or "").strip()
-                num = int(body.get("gift_num") or 1)
                 itm = (body.get("gift_item") or "礼物").strip()
+                try:
+                    num = int(body.get("gift_num") or 1)
+                    gift_value = int(body.get("gift_value") or 0)
+                    combo = int(body.get("combo") or num)
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "gift_num/gift_value/combo must be numbers"})
+                num = max(1, num)
+                gift_value = max(0, gift_value)
+                combo = max(num, combo)
+                # 先走“快速演出”通道：不等 DeepSeek/TTS，礼物一到就能触发动作。
+                # 导演失败不能影响礼物入队/LLM 感谢链路，所以单独兜底。
+                try:
+                    action = publish_action(DIRECTOR.ingest({
+                        "nick": nick or "神秘人",
+                        "gift": itm,
+                        "count": num,
+                        "value": gift_value,
+                        "combo": combo,
+                        "gift_id": str(body.get("gift_id") or ""),
+                        "event_id": str(body.get("event_id") or ""),
+                    }))
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
                 item = {
                     "kind": "gift", "user": nick, "priority": priority,
                     "gift_item": itm, "gift_num": num,
-                    "gift_value": int(body.get("gift_value") or 0),
+                    "gift_value": gift_value,
                     "content": f"观众「{nick or '神秘人'}」送了 {num} 个「{itm}」",
                 }
             elif (body.get("content") or "").strip():
@@ -550,8 +631,11 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 return self._send(400, {"error": "content required"})
             ok = enqueue(item)
-            return self._send(200, {"queued": ok, "depth": len(QUEUE),
-                                    "status": "queued" if ok else "skipped"})
+            response = {"queued": ok, "depth": len(QUEUE),
+                        "status": "queued" if ok else "skipped"}
+            if action:
+                response["action"] = action
+            return self._send(200, response)
         return self._send(404, {"error": "not found"})
 
     def log_message(self, *a):
@@ -562,12 +646,14 @@ if __name__ == "__main__":
     if TTS_BACKEND == "piper":
         _warmup_piper()  # 同步预热（阻塞几秒，避免与 worker 线程竞争加载 g2pw 模型）
     threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=director_tick_loop, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"数字人桥已启动：http://{HOST}:{PORT}")
     print(f"  - 虚拟人页面： http://{HOST}:{PORT}/")
     print(f"  - 收弹幕：     POST http://{HOST}:{PORT}/api/danmaku")
     print(f"  - 查状态：     GET  http://{HOST}:{PORT}/api/state")
     print(f"  - 本地音频：   GET  http://{HOST}:{PORT}/audio")
+    print(f"  - 礼物规则：   {DIRECTOR.snapshot().get('rules', 0)} 条（config/gift_actions.json）")
     print(f"  渲染后端 TTS_BACKEND = {TTS_BACKEND}（local=本地 say / vidu=云端对口型）")
     print("提示：开播前请确认 .env 已填 DeepSeek Key。")
     try:

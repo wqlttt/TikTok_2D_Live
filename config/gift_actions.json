@@ -1,0 +1,198 @@
+{
+  "_comment": "礼物行为规则：按 priority 从高到低匹配；timeline 是相对动作开始的时间轴（秒）。当前默认按 Hiyori 的 TapBody[0] 编写，换模型先运行 inspect_live2d.py。",
+  "version": 1,
+  "defaults": {
+    "duration": 2.4,
+    "priority": 10,
+    "cooldown": 0,
+    "user_cooldown": 0,
+    "interruptible": true
+  },
+  "rules": [
+    {
+      "id": "large_gift",
+      "label": "大礼物全屏演出",
+      "match": {
+        "min_value": 100
+      },
+      "priority": 80,
+      "cooldown": 20,
+      "user_cooldown": 30,
+      "interruptible": false,
+      "duration": 5.0,
+      "timeline": [
+        {
+          "at": 0,
+          "type": "effect",
+          "name": "fireworks",
+          "duration": 3.2
+        },
+        {
+          "at": 0.2,
+          "type": "toast",
+          "text": "🎉 {nick} 送出 {gift} x{count}！",
+          "duration": 3.2
+        },
+        {
+          "at": 1.0,
+          "type": "effect",
+          "name": "confetti",
+          "duration": 3.0
+        }
+      ]
+    },
+    {
+      "id": "combo_10",
+      "label": "连击/数量 10+",
+      "match": {
+        "min_combo": 10
+      },
+      "priority": 60,
+      "cooldown": 12,
+      "user_cooldown": 20,
+      "interruptible": true,
+      "duration": 3.2,
+      "timeline": [
+        {
+          "at": 0,
+          "type": "motion",
+          "group": "TapBody",
+          "index": 0
+        },
+        {
+          "at": 0.15,
+          "type": "effect",
+          "name": "rose_rain",
+          "duration": 2.8
+        },
+        {
+          "at": 0.2,
+          "type": "toast",
+          "text": "🌹 {nick} 连击 x{combo}！",
+          "duration": 2.6
+        }
+      ]
+    },
+    {
+      "id": "heart_gift",
+      "label": "特定礼物：小心心",
+      "match": {
+        "names": ["小心心", "爱心"],
+        "max_value": 9
+      },
+      "priority": 30,
+      "cooldown": 4,
+      "user_cooldown": 6,
+      "interruptible": true,
+      "duration": 2.2,
+      "timeline": [
+        {
+          "at": 0,
+          "type": "motion",
+          "group": "TapBody",
+          "index": 0
+        },
+        {
+          "at": 0.05,
+          "type": "effect",
+          "name": "hearts",
+          "duration": 2.0
+        },
+        {
+          "at": 0.15,
+          "type": "toast",
+          "text": "💗 {nick} 送了 {gift}！",
+          "duration": 2.2
+        }
+      ]
+    },
+    {
+      "id": "medium_gift",
+      "label": "中礼物组合动作",
+      "match": {
+        "min_value": 10,
+        "max_value": 99
+      },
+      "priority": 40,
+      "cooldown": 6,
+      "user_cooldown": 10,
+      "interruptible": true,
+      "duration": 3.2,
+      "timeline": [
+        {
+          "at": 0,
+          "type": "motion",
+          "group": "TapBody",
+          "index": 0
+        },
+        {
+          "at": 0.1,
+          "type": "effect",
+          "name": "hearts",
+          "duration": 2.2
+        },
+        {
+          "at": 0.2,
+          "type": "toast",
+          "text": "💖 谢谢 {nick} 的 {gift} x{count}！",
+          "duration": 2.6
+        }
+      ]
+    },
+    {
+      "id": "small_gift",
+      "label": "小礼物微反应",
+      "match": {
+        "max_value": 9
+      },
+      "priority": 20,
+      "cooldown": 3,
+      "user_cooldown": 5,
+      "interruptible": true,
+      "duration": 2.2,
+      "timeline": [
+        {
+          "at": 0,
+          "type": "motion",
+          "group": "TapBody",
+          "index": 0
+        },
+        {
+          "at": 0.05,
+          "type": "effect",
+          "name": "sparkles",
+          "duration": 1.8
+        },
+        {
+          "at": 0.1,
+          "type": "toast",
+          "text": "谢谢 {nick} 的 {gift}！",
+          "duration": 2.0
+        }
+      ]
+    },
+    {
+      "id": "fallback",
+      "label": "兜底感谢",
+      "match": {},
+      "priority": 1,
+      "cooldown": 0,
+      "interruptible": true,
+      "duration": 2.0,
+      "timeline": [
+        {
+          "at": 0,
+          "type": "effect",
+          "name": "sparkles",
+          "duration": 1.5
+        },
+        {
+          "at": 0.05,
+          "type": "toast",
+          "text": "谢谢 {nick} 的 {gift}！",
+          "duration": 2.0
+        }
+      ]
+    }
+  ]
+}
