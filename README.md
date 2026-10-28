@@ -28,7 +28,8 @@
 - **抖音实时弹幕**：douyinLive（Go，本地签名）+ cyber-xiaoya-danmaku 转发
 - **DeepSeek 回复**：可配人设提示词，带最近 8 轮对话记忆 + 观众昵称点名
 - **本地 TTS**：macOS 自带 `say`，零依赖（可替换 fireredtts3-onnx）
-- **Live2D Cubism 4**：官方示例模型 Hiyori，音频实时驱动口型，内置自动眨眼/呼吸/头发物理
+- **Live2D Cubism 4**：官方示例模型 Hiyori，音频实时驱动口型，内置呼吸/头发物理
+- **皮套动作引擎**：待机/思考/说话三种状态、眼神扫视、自然眨眼、重音点头、说话比划、7 种情绪表情（由 LLM 情绪标签驱动），详见「皮套动作」
 - **礼物互动（最小闭环）**：礼物事件 → 规则导演 → Live2D 动作 / 特效 / 礼物浮层；支持优先级、冷却、打断、排队
 - **大礼物纯特效演出**：使用开源 [canvas-confetti](https://github.com/catdad/canvas-confetti) 做烟花/彩带/玫瑰雨，不占用 Live2D 动作组
 - **弹幕飘屏** + 回复字幕
@@ -46,6 +47,7 @@
 │   ├── gift-effects.js  # 礼物特效（优先 canvas-confetti，CSS 兜底）
 │   ├── gift-effects.css
 │   ├── gift-player.js   # ActionPlan 播放器（时间轴 → motion/effect/video/toast）
+│   ├── avatar-motion.js # 皮套动作引擎（状态/眼神/眨眼/情绪/手势/口型）
 │   ├── videos/          # 大礼物预渲染视频（可选）
 │   └── vendor/
 │       ├── confetti.browser.js    # canvas-confetti 1.9.3
@@ -55,7 +57,8 @@
 │   ├── gift_actions.json     # 礼物 → 演出规则
 │   └── persona_prompt.md     # DeepSeek 人设提示词
 ├── tests/
-│   └── test_director.py      # 导演规则单测
+│   ├── test_director.py      # 导演规则单测
+│   └── test_bridge.py        # 队列调度 / 流式切句 / 情绪标签单测
 ├── setup.sh             # 一键部署脚本（下载运行库/模型/弹幕依赖）
 ├── setup_piper.sh       # 可选：安装本地 Piper TTS（音质好）
 ├── patches/winsound.py       # macOS 兼容补丁（见下）
@@ -318,6 +321,7 @@ bash setup_piper.sh   # 安装 piper-tts + 下载音色(小雅) + g2pw 模型(~2
 | `SAY_VOICE` | macOS `say` 音色（默认 `Tingting`） |
 | `SAY_VOICE_MAP` | 弹幕关键词→音色（JSON） |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | 桥监听地址/端口 |
+| `EMOTION_TAGS` | `1`（默认）让 LLM 输出情绪标签驱动表情；`0` 关闭 |
 | `DEEPSEEK_STREAM` | `1`（默认）流式生成 + 按句合成，第一句生成完就开口；`0` 整段生成后再合成 |
 | `BRIDGE_MIN_INTERVAL` | 两条回复最少间隔秒数（默认 3，在后台节奏控制里生效，礼物不受限） |
 | `BRIDGE_MAX_QUEUE` | 排队上限（默认 20） |
@@ -333,6 +337,27 @@ bash setup_piper.sh   # 安装 piper-tts + 下载音色(小雅) + g2pw 模型(~2
 - **合并**：同一观众排队中的礼物合并成一次感谢（同名礼物合计数量）
 
 `/api/state` 的 `queue` 字段给出当前深度和 `expired` / `evicted` / `deduped` / `rejected` 计数；`timings` 里的 `first_audio` 是从开始处理到第一句语音合成完成的耗时。
+
+## 皮套动作
+
+`static/avatar-motion.js` 在模型自带 Idle 动作之上分层叠加：
+
+| 层 | 内容 |
+|---|---|
+| 程序化细节 | 自然眨眼（偶尔连眨）、眼神扫视、待机重心转移、偶尔耸肩/小手势 |
+| 状态 | **待机**：四处看看；**思考**（LLM 生成中、还没开口）：抬眼、歪头、皱眉；**说话**：看镜头，摆头幅度随音量，重音处点头，每句开头按概率比划 |
+| 情绪 | 开心（先笑成 ^^）/ 害羞（脸红低头看旁边）/ 惊讶 / 难过 / 生气 / 思考 / 平静，用表情参数组合而成，不依赖模型自带表情文件 |
+| 事件 | 新弹幕飘过时瞥一眼；收到礼物开心点头挥手，大礼物先惊讶再开心 |
+
+情绪来自 LLM：prompt 末尾会追加指令，让回复以 `[开心]` 这类标签开头；bridge 剥掉标签（不念、不显示），以 `emotion` 字段随回复下发。`EMOTION_TAGS=0` 可关闭。
+
+实现要点：
+
+- 参数在 pixi-live2d-display 的 `afterMotionUpdate` 事件里写入（motion 之后、物理之前），头发/裙摆物理会跟随头部动作；叠加型参数每帧先复位，避免偏移累积
+- Idle 动作对头/身体的幅度压缩到 50%（说话时 25%），否则 Hiyori 的 Idle 叠加呼吸和本层会顶到 ±30° 极限
+- 口型/眨眼优先用 model3.json 声明的 `LipSync` / `EyeBlink` 参数组（Mao 的口型是 `ParamA`）
+- 每个参数写入前检查模型是否存在，缺什么跳过什么；8 个示例模型中 Ren 的 moc3 为 v6 格式，当前 pixi-live2d-display 0.4.0 无法加载（与动作引擎无关）
+- 调试：浏览器控制台 `__avatarMotion.setEmotion("shy", 5)`、`__avatarMotion.debug = {ParamArmLA: 10}`
 
 ## 换 Live2D 模型
 

@@ -314,9 +314,9 @@ def _new_reply_id():
     return f"r{int(time.time() * 1000)}"
 
 
-def finish_reply(reply, voice_label, user, content, timings, say_voice=None):
+def finish_reply(reply, voice_label, user, content, timings, say_voice=None, emotion=""):
     """合成整段语音 + 更新状态 + 入回复队列（换角色/直接念/非流式回复共用）。"""
-    reply = filter_reply(reply)   # 本地敏感词兜底
+    reply = filter_reply(_ANY_TAG_RE.sub("", reply).strip())   # 本地敏感词兜底
     text = strip_emoji(reply)
     t0 = time.time()
     wav_path = local_tts(text, say_voice) if text else ""
@@ -327,8 +327,64 @@ def finish_reply(reply, voice_label, user, content, timings, say_voice=None):
                       local_path=wav_path, timings=timings,
                       error="", updated_at=time.strftime("%H:%M:%S"))
     _push_reply({"reply_id": _new_reply_id(), "part": 0, "final": True,
-                 "user": user, "content": content, "reply": reply, "voice": voice_label},
-                wav_path)
+                 "user": user, "content": content, "reply": reply, "voice": voice_label,
+                 "emotion": emotion}, wav_path)
+
+
+# ---------------------------------------------------------------- 情绪标签
+# LLM 按 prompt 在回复开头输出「[开心]」之类的标签（见 verify_pipeline.EMOTION_INSTRUCTION）。
+# 这里把标签剥掉（不念、不显示），换成英文代号随回复下发，前端据此切换 Live2D 表情。
+
+EMOTION_MAP = {"开心": "happy", "害羞": "shy", "惊讶": "surprised", "难过": "sad",
+               "生气": "angry", "思考": "thinking", "平静": "neutral"}
+EMOTION_LABEL = {v: k for k, v in EMOTION_MAP.items()}
+_TAG_ALT = "|".join(EMOTION_MAP)
+_LEAD_TAG_RE = re.compile(r"^\s*[\[【](" + _TAG_ALT + r")[\]】]\s*")
+_ANY_TAG_RE = re.compile(r"[\[【](?:" + _TAG_ALT + r")[\]】]")
+
+
+def parse_emotion(text):
+    """整段文本：返回 (情绪代号或空串, 去掉标签后的文本)。"""
+    m = _LEAD_TAG_RE.match(text or "")
+    emotion = EMOTION_MAP[m.group(1)] if m else ""
+    rest = text[m.end():] if m else (text or "")
+    return emotion, _ANY_TAG_RE.sub("", rest).strip()
+
+
+def strip_emotion_stream(deltas, out):
+    """流式文本：识别开头的情绪标签写入 out["emotion"]，其余增量原样往下传。
+
+    只在开头几个字符内等待标签；不是合法标签就原样放行，不会吞字。
+    """
+    buf = ""
+    decided = False
+    for d in deltas:
+        if decided:
+            yield d
+            continue
+        buf += d
+        head = buf.lstrip()
+        if not head:
+            continue
+        if head[0] not in "[【":
+            decided = True
+            yield buf
+            continue
+        m = _LEAD_TAG_RE.match(buf)
+        if m:
+            out["emotion"] = EMOTION_MAP[m.group(1)]
+            decided = True
+            if buf[m.end():]:
+                yield buf[m.end():]
+        elif len(head) > 6 or "]" in head or "】" in head:
+            decided = True        # 方括号开头但不是情绪标签：照常输出
+            yield buf
+    if not decided and buf:
+        emotion, rest = parse_emotion(buf)
+        if emotion:
+            out["emotion"] = emotion
+        if rest:
+            yield rest
 
 
 # ---------------------------------------------------------------- 流式按句合成
@@ -382,7 +438,7 @@ def iter_sentences(deltas):
 
 
 def stream_reply(content, user, voice_label, say_voice, timings):
-    """DeepSeek 流式生成 + 逐句本地 TTS：第一句生成完就开口。返回完整回复文本。"""
+    """DeepSeek 流式生成 + 逐句本地 TTS：第一句生成完就开口。返回 (完整回复, 情绪代号)。"""
     t0 = time.time()
     reply_id = _new_reply_id()
     full = ""          # 气泡里显示的累计文本（含 emoji）
@@ -390,10 +446,12 @@ def stream_reply(content, user, voice_label, say_voice, timings):
     part = 0
     tts_total = 0.0
     last_entry = None
-    deltas = deepseek_stream(content, nick=user, history=list(HISTORY),
-                             user_context=user_context(user))
+    meta = {}
+    deltas = strip_emotion_stream(
+        deepseek_stream(content, nick=user, history=list(HISTORY),
+                        user_context=user_context(user)), meta)
     for seg in iter_sentences(deltas):
-        seg = filter_reply(carry + seg)
+        seg = filter_reply(_ANY_TAG_RE.sub("", carry + seg))
         carry = ""
         speak_text = strip_emoji(seg).strip()
         if not speak_text or all(c in _STRONG_PUNCT or c in _WEAK_PUNCT for c in speak_text):
@@ -409,7 +467,8 @@ def stream_reply(content, user, voice_label, say_voice, timings):
             timings["first_audio"] = round(time.time() - t0, 2)
         last_entry = _push_reply({"reply_id": reply_id, "part": part, "final": False,
                                   "user": user, "content": content, "reply": full,
-                                  "say": speak_text, "voice": voice_label}, wav_path)
+                                  "say": speak_text, "voice": voice_label,
+                                  "emotion": meta.get("emotion", "")}, wav_path)
         with LOCK:
             LATEST.update(reply=full, voice=voice_label, local_path=wav_path)
         part += 1
@@ -428,7 +487,7 @@ def stream_reply(content, user, voice_label, say_voice, timings):
         LATEST.update(status="done", reply=full, voice=voice_label,
                       audio_url="", task_id="", video_url="", timings=timings,
                       error="", updated_at=time.strftime("%H:%M:%S"))
-    return full
+    return full, meta.get("emotion", "")
 
 
 def process_one(item):
@@ -447,7 +506,8 @@ def process_one(item):
         if kind == "chat":
             new_model = try_switch_model(content)
             if new_model:
-                finish_reply(f"好嘞，换到「{new_model}」啦～", "默认", user, content, timings)
+                finish_reply(f"好嘞，换到「{new_model}」啦～", "默认", user, content, timings,
+                             emotion="happy")
                 return
 
         # 直接念（进场/关注/点赞/守护/醒目留言等）
@@ -465,20 +525,23 @@ def process_one(item):
         if TTS_BACKEND in ("local", "piper"):
             say_voice, voice_label = pick_say_voice(content)
             if STREAM_REPLY:
-                reply = stream_reply(content, user, voice_label, say_voice, timings)
+                reply, emotion = stream_reply(content, user, voice_label, say_voice, timings)
             else:
                 t0 = time.time()
-                reply = deepseek_reply(content, nick=user, history=list(HISTORY),
-                                       user_context=user_context(user))
+                emotion, reply = parse_emotion(
+                    deepseek_reply(content, nick=user, history=list(HISTORY),
+                                   user_context=user_context(user)))
                 timings["deepseek"] = round(time.time() - t0, 2)
-                finish_reply(reply, voice_label, user, content, timings, say_voice=say_voice)
-            _remember(user, content, reply)
+                finish_reply(reply, voice_label, user, content, timings,
+                             say_voice=say_voice, emotion=emotion)
+            _remember(user, content, reply, emotion)
         else:
             t0 = time.time()
-            reply = deepseek_reply(content, nick=user, history=list(HISTORY),
-                                   user_context=user_context(user))
+            emotion, reply = parse_emotion(
+                deepseek_reply(content, nick=user, history=list(HISTORY),
+                               user_context=user_context(user)))
             timings["deepseek"] = round(time.time() - t0, 2)
-            _remember(user, content, reply)
+            _remember(user, content, reply, emotion)
 
             voice_id, voice_label = pick_voice(content)
             t0 = time.time()
@@ -508,7 +571,7 @@ def process_one(item):
                               error="", updated_at=time.strftime("%H:%M:%S"))
             _push_reply({"reply_id": _new_reply_id(), "part": 0, "final": True,
                          "user": user, "content": content, "reply": reply,
-                         "voice": voice_label}, "")
+                         "voice": voice_label, "emotion": emotion}, "")
     except BaseException as e:  # noqa: BLE001  require() 抛 SystemExit，也要接住，否则 worker 线程会死
         with LOCK:
             LATEST.update(status="error", error=str(e) or type(e).__name__, timings=timings,
@@ -518,9 +581,11 @@ def process_one(item):
             raise
 
 
-def _remember(user, content, reply):
+def _remember(user, content, reply, emotion=""):
     HISTORY.append({"role": "user", "content": f"弹幕：{content}"})
-    HISTORY.append({"role": "assistant", "content": reply})
+    # 历史里保留情绪标签：LLM 看到自己一直这样输出，后续回复才会稳定带标签
+    tag = f"[{EMOTION_LABEL[emotion]}]" if emotion in EMOTION_LABEL else ""
+    HISTORY.append({"role": "assistant", "content": tag + reply})
     if user:
         USER_MEMORY.setdefault(user, deque(maxlen=3)).append((content, reply))
 
