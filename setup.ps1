@@ -35,15 +35,70 @@ Set-Location $Root
 
 function Info($msg) { Write-Host "==> $msg" -ForegroundColor Green }
 function Warn($msg) { Write-Host "WARN: $msg" -ForegroundColor Yellow }
-function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+function Fail($msg) {
+    # 同时写成功流：PS 5.1 下 Write-Host 后紧跟 exit，输出被重定向时最后一笔
+    # 会来不及刷出，表现为「退出码 1 但没有任何错误信息」的静默失败。
+    Write-Host "ERROR: $msg" -ForegroundColor Red
+    Write-Output "ERROR: $msg"
+    exit 1
+}
 
 function Write-Utf8NoBom {
     param([string] $Path, [string] $Text)
+    # .NET 的相对路径按「进程当前目录」解析，而 PowerShell 的 Set-Location 只改
+    # 自己的 location，两者可能不一致（ISE、部分宿主、快捷方式启动时都会分叉）。
+    # 统一以 $Root 为基准转成绝对路径，避免写到别处或报「找不到路径的一部分」。
+    if (-not [System.IO.Path]::IsPathRooted($Path)) {
+        $Path = Join-Path $Root $Path
+    }
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Invoke-Native {
+    <#
+      执行外部命令并返回退出码。
+
+      为什么需要这个包装：Windows PowerShell 5.1 在
+      $ErrorActionPreference = "Stop" 时，会把原生命令写入 stderr 的内容包装成
+      ErrorRecord 并当作**终止错误**抛出。而 git 的进度信息 "Cloning into ..."
+      恰好写在 stderr —— 于是 `git clone ... 2>&1 | Out-Null` 会在克隆完全成功的
+      情况下也把脚本打断（实测抛 RemoteException）。go build 同理。
+
+      这里把 EAP 局部降级为 Continue，改用 $LASTEXITCODE 判断成败。
+      -Quiet 用于丢弃 git 的进度噪声；不传则保留 stderr 便于排查失败原因。
+    #>
+    param(
+        [scriptblock] $Command,
+        [switch] $Quiet
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        if ($Quiet) { & $Command 2>$null } else { & $Command }
+        return $LASTEXITCODE
+    } catch {
+        # 兜底：任何漏网的终止错误都转成非零退出码，绝不让脚本无声中断
+        Write-Host ("WARN: 外部命令执行异常：" + $_.Exception.Message) -ForegroundColor Yellow
+        return 1
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
+function Get-NativeOutput {
+    <# 执行外部命令并只返回 stdout，隔离 stderr 与 EAP 终止错误。 #>
+    param([scriptblock] $Command)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        return (& $Command 2>$null)
+    } finally {
+        $ErrorActionPreference = $prev
+    }
 }
 
 Write-Host "=============================================="
@@ -62,9 +117,9 @@ if (-not $PyCmd) { Fail "未找到 Python，请先安装 Python 3.10+ 并勾选 
 $PyArgs = @()
 if ($PyCmd -eq "py") { $PyArgs = @("-3") }
 
-$pyVer = (& $PyCmd @PyArgs -c "import sys; print('%d.%d' % sys.version_info[:2])") 2>$null
+$pyVer = Get-NativeOutput { & $PyCmd @PyArgs -c "import sys; print('%d.%d' % sys.version_info[:2])" }
 if (-not $pyVer) { Fail "Python 无法运行，请检查安装" }
-$pyParts = $pyVer.Split(".")
+$pyParts = "$pyVer".Trim().Split(".")
 $pyMajor = [int]$pyParts[0]
 $pyMinor = [int]$pyParts[1]
 if ($pyMajor -lt 3 -or ($pyMajor -eq 3 -and $pyMinor -lt 8)) {
@@ -85,8 +140,8 @@ Info "安装 Python 依赖 (requests / python-dotenv)"
 if ($DryRun) {
     Write-Host "    (dry-run) pip install requests python-dotenv" -ForegroundColor DarkGray
 } else {
-    & $PyCmd @PyArgs -m pip install -q --disable-pip-version-check requests python-dotenv
-    if ($LASTEXITCODE -ne 0) { Warn "pip 安装失败，请手动执行：python -m pip install requests python-dotenv" }
+    $pipRc = Invoke-Native { & $PyCmd @PyArgs -m pip install -q --disable-pip-version-check requests python-dotenv }
+    if ($pipRc -ne 0) { Warn "pip 安装失败，请手动执行：python -m pip install requests python-dotenv" }
 }
 
 # ---------------------------------------------------------------- 3. Live2D 运行库
@@ -119,22 +174,37 @@ if ($DryRun) {
     Warn "跳过模型下载：缺少 git。可手动从 https://github.com/Live2D/CubismWebSamples 下载后放入 live2d/"
 } else {
     $tmp = Join-Path $Root ".live2d_tmp"
-    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
-    git clone --depth 1 --filter=blob:none --sparse https://github.com/Live2D/CubismWebSamples.git $tmp 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail "克隆 CubismWebSamples 失败，请检查网络" }
-    Push-Location $tmp
-    $paths = $Models | ForEach-Object { "Samples/Resources/$_" }
-    git sparse-checkout set @paths 2>&1 | Out-Null
-    Pop-Location
-    foreach ($m in $Models) {
-        $src = Join-Path $tmp "Samples/Resources/$m"
-        if (Test-Path $src) {
-            Copy-Item -Recurse -Force $src (Join-Path $Root "live2d/$m")
+    try {
+        if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
+        $rc = Invoke-Native -Quiet { git clone --depth 1 --filter=blob:none --sparse https://github.com/Live2D/CubismWebSamples.git $tmp }
+        if ($rc -ne 0) {
+            Warn "克隆 CubismWebSamples 失败（退出码 $rc），请检查网络后重跑本脚本"
         } else {
-            Warn "模型 $m 未取到，已跳过"
+            Push-Location $tmp
+            $paths = $Models | ForEach-Object { "Samples/Resources/$_" }
+            $rc = Invoke-Native -Quiet { git sparse-checkout set @paths }
+            Pop-Location
+            if ($rc -ne 0) { Warn "sparse-checkout 返回 $rc，将只复制已取到的模型" }
+
+            $copied = 0
+            foreach ($m in $Models) {
+                $src = Join-Path $tmp "Samples/Resources/$m"
+                if (Test-Path $src) {
+                    Copy-Item -Recurse -Force $src (Join-Path $Root "live2d/$m")
+                    $copied++
+                } else {
+                    Warn "模型 $m 未取到，已跳过"
+                }
+            }
+            if ($copied -eq 0) { Warn "一个模型都没取到，虚拟人页面将无法加载" }
+            else { Info "  已就位 $copied 个模型" }
         }
+    } catch {
+        Warn "模型下载阶段出错：$($_.Exception.Message)"
+        Warn "可稍后重跑本脚本，或手动从 https://github.com/Live2D/CubismWebSamples 下载后放入 live2d/"
+    } finally {
+        if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
     }
-    Remove-Item -Recurse -Force $tmp
 }
 
 # ---------------------------------------------------------------- 5. 弹幕采集依赖
@@ -146,8 +216,8 @@ if (-not (Test-Path "douyinLive")) {
     } elseif (-not $HasGit) {
         Warn "跳过 douyinLive：缺少 git"
     } else {
-        git clone --depth 1 https://github.com/jwwsjlm/douyinLive.git 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Warn "克隆 douyinLive 失败" }
+        $rc = Invoke-Native -Quiet { git clone --depth 1 https://github.com/jwwsjlm/douyinLive.git }
+        if ($rc -ne 0) { Warn "克隆 douyinLive 失败（退出码 $rc）" }
     }
 }
 
@@ -165,10 +235,9 @@ if ((Test-Path "douyinLive") -and -not (Test-Path "douyinLive/douyinLive.exe")) 
         Write-Host "    (dry-run) go build -o douyinLive.exe ./cmd/main" -ForegroundColor DarkGray
     } elseif ($HasGo) {
         Push-Location "douyinLive"
-        go build -o douyinLive.exe ./cmd/main
-        $buildRc = $LASTEXITCODE
+        $buildRc = Invoke-Native { go build -o douyinLive.exe ./cmd/main }
         Pop-Location
-        if ($buildRc -eq 0) { Info "  已编译 douyinLive.exe" } else { Warn "douyinLive 编译失败（需要 Go 1.20+）" }
+        if ($buildRc -eq 0) { Info "  已编译 douyinLive.exe" } else { Warn "douyinLive 编译失败（退出码 $buildRc，需要 Go 1.20+）" }
     } else {
         Warn "  跳过 douyinLive 编译：未安装 Go。装好后执行：cd douyinLive; go build -o douyinLive.exe ./cmd/main"
     }
@@ -178,8 +247,8 @@ if (-not (Test-Path "cyber-xiaoya-danmaku")) {
     if ($DryRun) {
         Write-Host "    (dry-run) git clone cyber-xiaoya-danmaku" -ForegroundColor DarkGray
     } elseif ($HasGit) {
-        git clone https://github.com/cyber-xiaoya/cyber-xiaoya-danmaku.git 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Warn "克隆 cyber-xiaoya-danmaku 失败" }
+        $rc = Invoke-Native -Quiet { git clone https://github.com/cyber-xiaoya/cyber-xiaoya-danmaku.git }
+        if ($rc -ne 0) { Warn "克隆 cyber-xiaoya-danmaku 失败（退出码 $rc）" }
     }
 }
 
