@@ -22,6 +22,8 @@ logs/
 *.log
 gift_board.json
 /piper_voices/
+.vscode/
+deliverables/
 
 # ============ 本地工作区数据 ============
 .workbuddy-ai/
