@@ -316,9 +316,9 @@ def sapi_tts(text, voice=None):
 
     out = _new_wav_path()
     fd, tmp = tempfile.mkstemp(prefix="dh_tts_", suffix=".txt")
-    os.close(fd)
     try:
-        with open(tmp, "w", encoding="utf-8", newline="") as f:
+        # 直接用 mkstemp 返回的 fd 打开，避免 close 与 open 之间文件被替换（TOCTOU）
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         cmd = [_powershell_exe(), "-NoProfile", "-NonInteractive",
                "-ExecutionPolicy", "Bypass", "-File", WIN_TTS_PS1,
