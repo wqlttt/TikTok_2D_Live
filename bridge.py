@@ -208,6 +208,21 @@ GIFT_BOARD = _load_gift_board()   # 送礼榜单：从文件恢复，跨重启�
 MAX_AUDIO_KEEP = int(env("MAX_AUDIO_KEEP", "50") or 50)   # 最多保留最近 N 条音频文件
 
 
+def _cleanup_audio_dir():
+    """启动时清空 audio/ 目录：清掉跨重启遗留的旧音频（REPLY_AUDIO 是内存态，重启后旧文件不再被引用）。"""
+    try:
+        d = os.path.join(BASE_DIR, "audio")
+        if os.path.isdir(d):
+            for fn in os.listdir(d):
+                if fn.endswith(".wav"):
+                    try:
+                        os.remove(os.path.join(d, fn))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
 def _cleanup_audio():
     """删除超出保留范围的旧音频文件，防止磁盘无限累积。"""
     if REPLY_SEQ <= MAX_AUDIO_KEEP:
@@ -1241,6 +1256,7 @@ class BridgeServer(ThreadingHTTPServer):
 if __name__ == "__main__":
     configure_console()   # Windows 下输出重定向时不因 GBK 编码崩溃
     check_auth_config()
+    _cleanup_audio_dir()   # 清掉跨重启遗留的旧音频
     if not BOUND_TO_LOOPBACK:
         discover_local_ips()
     if TTS_BACKEND_ERROR:

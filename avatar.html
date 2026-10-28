@@ -7,6 +7,7 @@
 <title>赛博小雅 · Live2D 虚拟人</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:transparent;}
+  ::selection{background:var(--accent);color:#fff;}
   :root{
     --ease-out:cubic-bezier(.23,1,.32,1);
     --ease-in-out:cubic-bezier(.77,0,.175,1);
@@ -28,6 +29,12 @@
   #l2d{position:absolute;inset:0;width:100%;height:100%;}
   #l2d-status{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);
     text-align:center;color:#b0556b;font-size:14px;padding:0 16px;}
+  #stage::after{content:"";position:absolute;inset:8px;border-radius:18px;
+    border:1px solid rgba(255,255,255,.5);pointer-events:none;z-index:5;}
+  #char-name{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:6;
+    padding:5px 16px;background:rgba(255,255,255,.9);color:#c05a78;
+    border-radius:999px;font-size:13px;font-weight:800;letter-spacing:.06em;
+    box-shadow:0 4px 14px rgba(0,0,0,.16);}
   #speech{position:relative;flex:0 0 min(320px,26vw);
     padding:16px 22px;background:#fff;border-radius:20px;
     box-shadow:0 8px 28px rgba(0,0,0,.22);font-size:24px;font-weight:600;
@@ -53,6 +60,7 @@
     border:none;border-radius:999px;cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,.3);opacity:.92;
     transition:transform .16s var(--ease-out),opacity .16s var(--ease-out);}
   #start-btn:active{transform:scale(.96);opacity:.85;}
+  #start-btn:focus-visible{outline:2px solid #fff;outline-offset:2px;}
   #left-panel{position:fixed;left:16px;top:16px;z-index:90;
     display:flex;flex-direction:column;align-items:stretch;gap:12px;
     width:min(340px,72vw);}
@@ -60,7 +68,10 @@
     background:var(--glass);color:#fff;border-radius:var(--radius);
     font-size:14px;backdrop-filter:blur(8px);
     box-shadow:var(--shadow);border:1px solid var(--glass-line);display:none;}
-  #gift-board .gb-title{font-weight:700;font-size:13px;opacity:.95;margin-bottom:6px;}
+  #gift-board .gb-title{display:flex;align-items:center;gap:7px;
+    font-weight:800;font-size:13px;letter-spacing:.06em;margin-bottom:6px;}
+  #gift-board .gb-title::before{content:"";width:7px;height:7px;border-radius:2px;
+    background:var(--gold);box-shadow:0 0 8px var(--gold);}
   #gift-board .gb-row{display:flex;justify-content:space-between;gap:14px;line-height:1.55;}
   #gift-board .gb-nick{color:#ffd166;font-weight:600;}
   #now-playing{position:relative;padding:12px 14px;
@@ -103,27 +114,26 @@
   #lyrics .lyr-line.cur{color:#fff;transform:scale(1.18);opacity:1;font-weight:800;}
   #lyrics .lyr-ch{transition:color .12s linear;}
   #lyrics .lyr-ch.sung{color:#ff5f87;}
-  #cost-panel{position:fixed;right:16px;top:16px;padding:12px 14px;
+  #right-panel{position:fixed;right:16px;top:16px;padding:12px 14px;
     background:var(--glass);color:#fff;border-radius:var(--radius);z-index:95;
     font-size:13px;backdrop-filter:blur(8px);box-shadow:var(--shadow);
     border:1px solid var(--glass-line);min-width:200px;}
-  #cost-panel .cp-row{display:flex;justify-content:space-between;gap:18px;line-height:1.7;}
-  #cost-panel .cp-label{opacity:.7;}
-  #cost-panel .cp-val{font-weight:700;}
-  #cost-panel #cp-cost{color:#ff5f87;}
-  #cost-panel #cp-gift{color:#ffd166;}
-  #cost-panel .cp-sum{border-top:1px solid rgba(255,255,255,.12);margin-top:4px;padding-top:4px;
-    justify-content:flex-start;}
-  #cost-panel #cp-verdict{font-size:12px;opacity:.85;}
-  #cost-panel .cp-val.flash{animation:cp-flash .5s var(--ease-out);}
+  #right-panel .rp-title{display:flex;align-items:center;gap:7px;
+    font-weight:800;font-size:13px;letter-spacing:.08em;margin-bottom:6px;}
+  #right-panel .rp-title::before{content:"";width:7px;height:7px;border-radius:2px;
+    background:var(--accent);box-shadow:0 0 8px var(--accent);}
+  #right-panel .rp-divider{border-top:1px solid var(--glass-line);margin:8px 0 6px;}
+  #right-panel .cp-row{display:flex;justify-content:space-between;gap:18px;line-height:1.7;}
+  #right-panel .cp-label{opacity:.7;}
+  #right-panel .cp-val{font-weight:700;}
+  #right-panel #cp-cost{color:#ff5f87;}
+  #right-panel #cp-gift{color:#ffd166;}
+  #right-panel .cp-sum{margin-top:3px;justify-content:flex-start;}
+  #right-panel #cp-verdict{font-size:12px;opacity:.85;}
+  #right-panel .cp-val.flash{animation:cp-flash .5s var(--ease-out);}
   @keyframes cp-flash{0%{transform:scale(1.22);color:#fff;}100%{transform:scale(1);}}
-  #cmd-hint{position:fixed;right:16px;top:112px;padding:10px 14px;
-    background:var(--glass);color:#fff;border-radius:var(--radius);
-    font-size:12px;backdrop-filter:blur(8px);box-shadow:var(--shadow);
-    border:1px solid var(--glass-line);line-height:1.9;min-width:180px;}
-  #cmd-hint .ch-title{font-weight:700;font-size:12px;opacity:.95;margin-bottom:1px;}
-  #cmd-hint .ch-item{opacity:.8;}
-  #cmd-hint .ch-item b{font-weight:600;margin-right:2px;}
+  #right-panel .ch-item{opacity:.8;font-size:12px;line-height:1.85;}
+  #right-panel .ch-item b{font-weight:600;margin-right:2px;}
   @media (prefers-reduced-motion:reduce){
     .danmaku{animation:none;}
     #now-playing .np-eq span{animation:none;}
@@ -142,6 +152,7 @@
     <div id="danmaku-layer"></div>
     <div id="fx-layer"></div>
     <div id="gift-toast"></div>
+    <div id="char-name">赛博小雅</div>
     </div>
     <div id="speech"></div>
   </div>
@@ -164,13 +175,13 @@
       <div class="lyr-line" id="lyr-next"></div>
     </div>
   </div>
-  <div id="cost-panel">
+  <div id="right-panel">
+    <div class="rp-title">直播数据</div>
     <div class="cp-row"><span class="cp-label">🤖 DeepSeek 消耗</span><span class="cp-val" id="cp-cost">¥0.00</span></div>
     <div class="cp-row"><span class="cp-label">🎁 礼物收入</span><span class="cp-val" id="cp-gift">0</span></div>
     <div class="cp-row cp-sum"><span id="cp-verdict">—</span></div>
-  </div>
-  <div id="cmd-hint">
-    <div class="ch-title">🎮 互动玩法</div>
+    <div class="rp-divider"></div>
+    <div class="rp-title">互动玩法</div>
     <div class="ch-item"><b>💬</b>发弹幕和我聊天</div>
     <div class="ch-item"><b>🎵</b>点歌/来一首 + 歌名</div>
     <div class="ch-item"><b>🎭</b>换角色（换Mao、换Haru…）</div>
@@ -471,7 +482,7 @@
     el.textContent = "";
     var title = document.createElement("div");
     title.className = "gb-title";
-    title.textContent = "🎁 礼物榜";
+    title.textContent = "礼物榜";
     el.appendChild(title);
     for (var i = 0; i < Math.min(board.length, 5); i++){
       var nick = board[i][0] || "?";

@@ -23,6 +23,7 @@ logs/
 gift_board.json
 gift_board.json.tmp
 usage.json
+config/stories.json
 /piper_voices/
 .vscode/
 
