@@ -48,6 +48,15 @@ DEFAULT_PERSONA = (
 )
 
 
+# 让 LLM 在回复开头标一个情绪，前端据此切换 Live2D 表情（bridge 会剥掉标签，不念、不显示）
+EMOTION_LABELS = ("开心", "害羞", "惊讶", "难过", "生气", "思考", "平静")
+EMOTION_INSTRUCTION = (
+    "\n8. 在回复最开头用方括号标出你此刻的情绪，只能从"
+    + "".join(f"[{x}]" for x in EMOTION_LABELS)
+    + "里选一个，例如「[开心]哈哈谢谢你～」。标签只出现一次，之后正常说话。"
+)
+
+
 def env(name, default=""):
     return os.environ.get(name, default).strip()
 
@@ -83,6 +92,8 @@ def _deepseek_request(danmaku: str, nick: str, history, user_context: str, strea
     temperature = float(env("DEEPSEEK_TEMPERATURE", "0.85") or 0.85)
 
     require(key, "缺少 DEEPSEEK_API_KEY")
+    if env("EMOTION_TAGS", "1").lower() not in ("0", "false", "no", "off"):
+        persona = persona + EMOTION_INSTRUCTION   # 单独追加，自定义 PERSONA_PROMPT 也生效
     messages = [{"role": "system", "content": persona}]
     for h in (history or []):
         if isinstance(h, dict) and h.get("role") and h.get("content"):

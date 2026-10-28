@@ -144,6 +144,30 @@ class SentenceSplitTest(unittest.TestCase):
         self.assertEqual(self.split(["没有", "标点"]), ["没有标点"])
 
 
+class EmotionTagTest(unittest.TestCase):
+    def run_stream(self, deltas):
+        out = {}
+        text = "".join(bridge.strip_emotion_stream(iter(deltas), out))
+        return out.get("emotion", ""), text
+
+    def test_parse_full_text(self):
+        self.assertEqual(bridge.parse_emotion("[害羞]哎呀别夸啦"), ("shy", "哎呀别夸啦"))
+        self.assertEqual(bridge.parse_emotion("【惊讶】哇！"), ("surprised", "哇！"))
+        self.assertEqual(bridge.parse_emotion("没有标签"), ("", "没有标签"))
+
+    def test_stream_tag_split_across_deltas(self):
+        self.assertEqual(self.run_stream(["[", "难过", "]", "呜呜"]), ("sad", "呜呜"))
+
+    def test_stream_no_tag_passthrough(self):
+        self.assertEqual(self.run_stream(["你好", "呀"]), ("", "你好呀"))
+
+    def test_stream_bracket_but_not_emotion(self):
+        self.assertEqual(self.run_stream(["[链接]", "点这里"]), ("", "[链接]点这里"))
+
+    def test_stream_only_tag(self):
+        self.assertEqual(self.run_stream(["[开心]"]), ("happy", ""))
+
+
 class StreamReplyTest(unittest.TestCase):
     def setUp(self):
         self._stream = bridge.deepseek_stream
@@ -159,8 +183,9 @@ class StreamReplyTest(unittest.TestCase):
     def test_segments_pushed_and_last_marked_final(self):
         bridge.deepseek_stream = lambda *a, **k: iter(["哈哈小明你好呀，", "今天开心吗？", "😄"])
         timings = {}
-        full = bridge.stream_reply("你好", "小明", "默认", None, timings)
+        full, emotion = bridge.stream_reply("你好", "小明", "默认", None, timings)
         self.assertEqual(full, "哈哈小明你好呀，今天开心吗？😄")
+        self.assertEqual(emotion, "")
         self.assertEqual(self.spoken, ["哈哈小明你好呀，", "今天开心吗？"])   # emoji 不念
         entries = list(bridge.REPLIES)
         self.assertEqual(len(entries), 2)
@@ -168,6 +193,14 @@ class StreamReplyTest(unittest.TestCase):
         self.assertEqual([e["final"] for e in entries], [False, True])
         self.assertEqual(entries[-1]["reply"], full)   # 气泡最终显示完整文本（含 emoji）
         self.assertIn("first_audio", timings)
+
+    def test_emotion_tag_stripped_and_attached(self):
+        bridge.deepseek_stream = lambda *a, **k: iter(["[开", "心]哈哈谢谢", "你呀，", "太好啦！"])
+        full, emotion = bridge.stream_reply("你好", "小明", "默认", None, {})
+        self.assertEqual(emotion, "happy")
+        self.assertEqual(full, "哈哈谢谢你呀，太好啦！")
+        self.assertNotIn("[", "".join(self.spoken))
+        self.assertTrue(all(e["emotion"] == "happy" for e in bridge.REPLIES))
 
     def test_empty_reply_raises(self):
         bridge.deepseek_stream = lambda *a, **k: iter(["😄"])

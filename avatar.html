@@ -72,6 +72,7 @@
 <script src="/static/vendor/confetti.browser.js"></script>
 <script src="/static/gift-effects.js"></script>
 <script src="/static/gift-player.js"></script>
+<script src="/static/avatar-motion.js"></script>
 <script>
 (function(){
   "use strict";
@@ -87,8 +88,12 @@
   var startHint = document.getElementById("start-hint");
   var statusEl = document.getElementById("l2d-status");
 
-  var currentOpen = 0, targetOpen = 0;
-  var speaking = false, wasSpeaking = false;
+  var speaking = false;
+  // 动作引擎：待机/思考/说话状态、眨眼、眼神、情绪、手势、口型都在这里（static/avatar-motion.js）
+  var motion = (typeof AvatarMotion === "function") ? new AvatarMotion({
+    isMotionLocked: function(){ return !!(giftPlayer && giftPlayer.isMotionActive()); }
+  }) : null;
+  window.__avatarMotion = motion;   // 调试用
   var lastDanmaku = "";
   var audioCtx = null, analyser = null;
 
@@ -109,7 +114,7 @@
     return fetch(url, opts);
   }
 
-  function setOpenness(o){ targetOpen = o; }
+  function setOpenness(o){ if (motion) motion.setLevel(o); }
 
   var loadToken = 0;
 
@@ -118,7 +123,7 @@
     try {
       var m = await PIXI.live2d.Live2DModel.from(
         "/live2d/" + name + "/" + name + ".model3.json",
-        { motionPreload: "IDLE", idleMotionGroup: "None" }
+        { motionPreload: "IDLE" }
       );
       if (myToken !== loadToken){   // 期间已有更新的加载请求，丢弃本次结果
         try { m.destroy(); } catch(e){}
@@ -148,8 +153,9 @@
           giftPlayer.setModel(model, document.getElementById("stage"));
         }
       }
-      // 自动 Idle 动作会驱动嘴部，和音频口型冲突，已通过 idleMotionGroup:"None" 关闭；
-      // 眨眼/呼吸由内置组件自动处理。
+      // 重新打开模型自带的 Idle 动作；嘴、眼睛、表情由动作引擎在 motion 之后覆盖，
+      // 不再和音频口型冲突。
+      if (motion) motion.attach(model);
       statusEl.style.display = "none";
     } catch(e){
       if (myToken === loadToken){
@@ -173,44 +179,6 @@
       console.error("Live2D init failed:", e);
     }
   }
-
-  // 主循环：口型平滑 + 写入 Live2D 参数 + 肢体动作
-  function applyGestures(now){
-    if (!coreModel) return;
-    // 只有礼物时间轴里包含 motion 时，才把参数控制权交给 motion；
-    // 纯特效大礼物不锁待机手势。
-    if (giftPlayer && giftPlayer.isMotionActive()) return;
-    var t = now / 1000;
-    if (speaking) {
-      // 说话时：轻微转头 + 双手轻摆（像在比划）
-      coreModel.addParameterValueById("ParamAngleY", Math.sin(t * 3.0) * 2.0);
-      coreModel.addParameterValueById("ParamAngleZ", Math.sin(t * 5.2) * 2.5);
-      var ph = 0.5 + 0.5 * Math.sin(t * 2.6);
-      coreModel.setParameterValueById("ParamHandL", ph * 0.6);
-      coreModel.setParameterValueById("ParamHandR", (1 - ph) * 0.6);
-    } else {
-      // 待机：偶尔耸肩
-      var cyc = now % 7000;
-      var shrug = cyc > 6300 ? Math.sin((cyc - 6300) / 700 * Math.PI) * 0.6 : 0;
-      coreModel.setParameterValueById("ParamShoulder", shrug);
-      coreModel.setParameterValueById("ParamHandL", 0);
-      coreModel.setParameterValueById("ParamHandR", 0);
-    }
-  }
-
-  function loop(now){
-    currentOpen += (targetOpen - currentOpen) * 0.3;
-    if (coreModel) {
-      // 只在说话时驱动嘴；不说话时把嘴交还给 motion，避免动作里的口型被 0 覆盖。
-      if (speaking || wasSpeaking) {
-        coreModel.setParameterValueById("ParamMouthOpenY", speaking ? currentOpen : 0);
-      }
-      wasSpeaking = speaking;
-      applyGestures(now || performance.now());
-    }
-    requestAnimationFrame(loop);
-  }
-  requestAnimationFrame(loop);
 
   function ensureAudio(){
     if (!audioCtx){
@@ -245,6 +213,7 @@
 
             var data = new Uint8Array(analyser.fftSize);
             speaking = true;
+            if (motion) motion.setSpeaking(true);
             function drive(){
               if (!speaking) return;
               analyser.getByteTimeDomainData(data);
@@ -256,7 +225,11 @@
               setOpenness(Math.min(1, Math.sqrt(sum / data.length) * 5));
               requestAnimationFrame(drive);
             }
-            src.onended = function(){ speaking = false; setOpenness(0); resolve(); };
+            src.onended = function(){
+              speaking = false;
+              if (motion) motion.setSpeaking(false);
+              resolve();
+            };
             src.start();
             drive();
           })
@@ -324,6 +297,11 @@
     var item = playQueue.shift();
     lastItem = item;
     showSpeech(item.reply);
+    if (motion){
+      // 情绪标签由后端从 LLM 回复里解析；每一段都续期，最后一段说完后再保持几秒
+      if (item.emotion) motion.setEmotion(item.emotion, item.final === false ? 8 : 4);
+      motion.onSentence(item.part || 0);
+    }
     playAudio(item.seq).then(function(){ playNext(); });
   }
 
@@ -346,7 +324,9 @@
     } else {
       el.textContent = content;
     }
-    el.style.top = (4 + Math.random() * 30) + "%";
+    var topPct = 4 + Math.random() * 30;
+    el.style.top = topPct + "%";
+    if (motion) motion.react("danmaku", { yFrac: topPct / 100 });
     layer.appendChild(el);
     el.addEventListener("animationend", function(){ el.remove(); });
     while (layer.children.length > 40) layer.firstChild.remove();
@@ -415,6 +395,7 @@
   function playAction(act){
     try {
       giftPlayer.play(act);
+      if (motion) motion.react("gift", { value: (act.gift && act.gift.value) || 0 });
     } catch (err) {
       console.warn("[avatar] gift action failed:", err);
     }
@@ -429,6 +410,8 @@
       var r = await apiFetch("/api/state" + (actionInit ? "?since=" + lastActionSeq : ""));
       var s = await r.json();
       updateStatus(s);
+      // LLM 生成期间（还没开口）进入「思考」状态：抬眼、歪头、皱眉，填补等待空档
+      if (motion) motion.setThinking(s.status === "processing" && !isPlaying);
       if (s.gift_board) updateGiftBoard(s.gift_board);
       if (s.model && s.model !== currentModelName){
         currentModelName = s.model;
