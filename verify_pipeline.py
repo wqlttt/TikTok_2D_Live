@@ -39,7 +39,7 @@ DEFAULT_PERSONA = (
     "你是「赛博小雅」，一个元气、幽默、自来熟的 AI 数字人主播，正在抖音直播间实时和观众聊天。"
     "说话要像朋友，不像客服机器人。要点：\n"
     "1. 观众名字会放在「（观众「XX」）」里，能叫名字就尽量叫名字互动，显得熟络。\n"
-    "2. 口语化，100~300 字，聊得丰富些、有内容有来有回，但别啰嗦堆砌；多用「哈哈/呀/啦/呢」和 emoji（😄😆✨）。\n"
+    "2. 口语化，40~80 字，简短精炼、一次一两句为主，别长篇大论；多用「哈哈/呀/啦/呢」和 emoji（😄😆✨）。\n"
     "3. 观众夸你→开心接住并回夸；提问→直接给答案别绕；吐槽→幽默化解；点名让你唱歌/跳舞→俏皮接招或讨价还价。\n"
     "4. 主动抛问题、接上一句的梗，让聊天有来有回；千万别每次都回「欢迎来到直播间」这种套话。\n"
     "5. 记得上下文：观众之前聊过的、你自己上一句说过的话，可以接着聊，别失忆。\n"
@@ -114,11 +114,55 @@ def _deepseek_request(danmaku: str, nick: str, history, user_context: str, strea
     return url, headers, body
 
 
+_USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage.json")
+
+_USAGE = {"prompt": 0, "completion": 0, "total": 0}
+
+
+def _load_usage():
+    """从文件恢复历史累计（跨重启持久化，和礼物榜一样）。"""
+    try:
+        if os.path.exists(_USAGE_FILE):
+            with open(_USAGE_FILE, encoding="utf-8") as f:
+                saved = json.load(f)
+                for k in _USAGE:
+                    _USAGE[k] = int(saved.get(k, 0) or 0)
+    except Exception:
+        pass
+
+
+def _save_usage():
+    try:
+        with open(_USAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_USAGE, f)
+    except Exception:
+        pass
+
+
+def get_usage():
+    """累计的 DeepSeek token 消耗（历史总额，供 bridge 做「消耗 vs 礼物」对比）。"""
+    return dict(_USAGE)
+
+
+def _accumulate_usage(u):
+    if not isinstance(u, dict):
+        return
+    _USAGE["prompt"] += int(u.get("prompt_tokens") or 0)
+    _USAGE["completion"] += int(u.get("completion_tokens") or 0)
+    _USAGE["total"] += int(u.get("total_tokens") or 0)
+    _save_usage()
+
+
+_load_usage()
+
+
 def deepseek_reply(danmaku: str, nick: str = "", history=None, user_context: str = "") -> str:
     url, headers, body = _deepseek_request(danmaku, nick, history, user_context, stream=False)
     resp = requests.post(url, headers=headers, json=body, timeout=60)
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    data = resp.json()
+    _accumulate_usage(data.get("usage"))
+    return data["choices"][0]["message"]["content"].strip()
 
 
 def deepseek_stream(danmaku: str, nick: str = "", history=None, user_context: str = ""):
@@ -141,6 +185,7 @@ def deepseek_stream(danmaku: str, nick: str = "", history=None, user_context: st
                 break
             try:
                 chunk = json.loads(data)
+                _accumulate_usage(chunk.get("usage"))
                 delta = chunk["choices"][0].get("delta") or {}
             except (ValueError, KeyError, IndexError, TypeError):
                 continue

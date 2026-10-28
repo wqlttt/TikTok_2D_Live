@@ -12,6 +12,78 @@
   },
   "rules": [
     {
+      "id": "gift_carnival",
+      "label": "嘉年华",
+      "match": { "names": ["嘉年华"] },
+      "priority": 100,
+      "cooldown": 20,
+      "interruptible": false,
+      "on_cooldown": "queue",
+      "queue_ttl": 60,
+      "duration": 5.0,
+      "timeline": [
+        { "at": 0, "type": "effect", "name": "fireworks", "duration": 3.5 },
+        { "at": 0.2, "type": "toast", "text": "🎆 {nick} 送出 {gift} x{count}！", "duration": 3.5 },
+        { "at": 0.8, "type": "effect", "name": "confetti", "duration": 3.0 }
+      ]
+    },
+    {
+      "id": "gift_rocket",
+      "label": "火箭",
+      "match": { "names": ["火箭"] },
+      "priority": 96,
+      "cooldown": 15,
+      "interruptible": false,
+      "on_cooldown": "queue",
+      "queue_ttl": 60,
+      "duration": 4.0,
+      "timeline": [
+        { "at": 0, "type": "effect", "name": "fireworks", "duration": 3.0 },
+        { "at": 0.2, "type": "toast", "text": "🚀 {nick} 送出 {gift} x{count}！", "duration": 3.0 }
+      ]
+    },
+    {
+      "id": "gift_car",
+      "label": "跑车",
+      "match": { "names": ["跑车", "保时捷", "兰博基尼", "法拉利"] },
+      "priority": 94,
+      "cooldown": 15,
+      "interruptible": false,
+      "on_cooldown": "queue",
+      "queue_ttl": 60,
+      "duration": 3.5,
+      "timeline": [
+        { "at": 0, "type": "effect", "name": "confetti", "duration": 3.0 },
+        { "at": 0.2, "type": "toast", "text": "🏎 {nick} 送出 {gift} x{count}！", "duration": 3.0 }
+      ]
+    },
+    {
+      "id": "gift_rose",
+      "label": "玫瑰/鲜花",
+      "match": { "names": ["玫瑰", "鲜花"] },
+      "priority": 90,
+      "cooldown": 10,
+      "interruptible": true,
+      "duration": 2.8,
+      "timeline": [
+        { "at": 0, "type": "effect", "name": "rose_rain", "duration": 2.6 },
+        { "at": 0.15, "type": "toast", "text": "🌹 {nick} 送出 {gift}！", "duration": 2.6 }
+      ]
+    },
+    {
+      "id": "gift_kiss",
+      "label": "亲吻",
+      "match": { "names": ["亲吻", "么么哒", "亲亲"] },
+      "priority": 88,
+      "cooldown": 6,
+      "interruptible": true,
+      "duration": 2.2,
+      "timeline": [
+        { "at": 0, "type": "effect", "name": "hearts", "duration": 2.0 },
+        { "at": 0.15, "type": "toast", "text": "😘 {nick} 送出 {gift}！", "duration": 2.0 }
+      ]
+    },
+    {
       "id": "large_gift",
       "label": "大礼物全屏演出",
       "match": {

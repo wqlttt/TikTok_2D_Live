@@ -49,6 +49,7 @@ from verify_pipeline import (
     deepseek_reply,
     deepseek_stream,
     env,
+    get_usage,
     pick_voice,
     vidu_lipsync_submit,
     vidu_lipsync_wait,
@@ -141,6 +142,7 @@ USER_MEMORY = {}           # 昵称 -> deque([(弹幕, 回复), ...]) 按人记�
 REPLIES = deque(maxlen=30) # 已完成的回复队列（供前端排队播放，避免下一条覆盖上一条）
 REPLY_SEQ = 0
 REPLY_AUDIO = {}           # seq -> 音频文件路径
+NOW_PLAYING = {"seq": 0, "name": "", "artist": "", "url": "", "pic": "", "lyric": []}  # 点歌：当前播放歌曲
 STARTED_AT = time.time()   # 桥启动时间(epoch)
 LAST_DANMAKU_TIME = None   # 上次收到弹幕的时间戳(epoch)，用于前端"是否在线"提示
 MODELS = ["Hiyori", "Haru", "Mao", "Natori", "Ren", "Rice", "Mark", "Wanko"]
@@ -508,6 +510,86 @@ def stream_reply(content, user, voice_label, say_voice, timings):
     return full, meta.get("emotion", "")
 
 
+def try_music_command(content):
+    """识别「点歌/来一首/放一首/播放」命令，返回歌名关键词或 None。"""
+    import re
+    m = re.search(r"^(?:点歌|来一首|放一首|放首歌|播放)\s*[:：]?\s*(.+)$", content)
+    if m:
+        kw = m.group(1).strip()
+        if kw and len(kw) <= 40:
+            return kw
+    return None
+
+
+_NETEASE_LOGGED = False
+
+
+def netease_login():
+    """用 MUSIC_U cookie 登录网易云（VIP 解锁完整版/高音质）。幂等。"""
+    global _NETEASE_LOGGED
+    if _NETEASE_LOGGED:
+        return
+    mu = env("NETEASE_MUSIC_U", "").strip()
+    if not mu:
+        return
+    try:
+        from pyncm import apis
+        apis.login.LoginViaCookie(MUSIC_U=mu)
+        _NETEASE_LOGGED = True
+    except Exception:
+        pass
+
+
+def parse_lrc(lrc_text):
+    """解析 LRC 文本为 [{t:秒, text:文本}]，跳过元信息行(作词/作曲等)。"""
+    import re
+    META = re.compile(r"^(作词|作曲|编曲|制作人|录音|混音|母带|监制|和声|吉他|贝斯|鼓|键盘|钢琴|弦乐|小提琴|大提琴|箫|二胡|演唱|出品|发行|OP|SP|版权|企划|统筹|配唱|人声|音乐总监|艺人)\s*[:：]")
+    lines = []
+    for line in (lrc_text or "").splitlines():
+        for m in re.finditer(r"\[(\d+):(\d+(?:\.\d+)?)\]([^\[]*)", line):
+            mm = int(m.group(1))
+            ss = float(m.group(2))
+            txt = m.group(3).strip()
+            if txt and not META.match(txt) and ":" not in txt and "：" not in txt:
+                lines.append({"t": mm * 60 + ss, "text": txt})
+    lines.sort(key=lambda x: x["t"])
+    return lines
+
+
+def netease_search(query):
+    """搜网易云歌曲，返回 {'id','name','artist','url','pic','lyric'} 或 None。"""
+    netease_login()
+    try:
+        from pyncm import apis
+        r = apis.cloudsearch.GetSearchResult(query, limit=5)
+        songs = (r.get("result") or {}).get("songs") or []
+        for s in songs:
+            sid = s.get("id")
+            name = s.get("name")
+            artist = "/".join(a.get("name", "") for a in (s.get("ar") or []) if a.get("name"))
+            al = s.get("al") or {}
+            pic = (al.get("picUrl") or "").replace("http://", "https://")
+            url = None
+            try:
+                u = apis.track.GetTrackAudio([sid], bitrate=320000, encodeType="aac")
+                url = ((u.get("data") or [{}])[0] or {}).get("url")
+            except Exception:
+                pass
+            lyric = []
+            if url:
+                try:
+                    lr = apis.track.GetTrackLyrics(str(sid))
+                    lrc_text = ((lr or {}).get("lrc") or {}).get("lyric") or ""
+                    lyric = parse_lrc(lrc_text)
+                except Exception:
+                    pass
+            if url:
+                return {"id": sid, "name": name, "artist": artist, "url": url, "pic": pic, "lyric": lyric}
+        return None
+    except Exception:
+        return None
+
+
 def process_one(item):
     """在后台线程执行完整链路。item 含 kind: chat(弹幕)/gift(礼物)/speak(直接念)。"""
     kind = item.get("kind", "chat")
@@ -526,6 +608,27 @@ def process_one(item):
             if new_model:
                 finish_reply(f"好嘞，换到「{new_model}」啦～", "默认", user, content, timings,
                              emotion="happy")
+                return
+
+        # 点歌命令（仅 chat）
+        if kind == "chat":
+            kw = try_music_command(content)
+            if kw:
+                song = netease_search(kw)
+                with LOCK:
+                    NOW_PLAYING["seq"] += 1
+                    NOW_PLAYING["name"] = song["name"] if song else ""
+                    NOW_PLAYING["artist"] = song["artist"] if song else ""
+                    NOW_PLAYING["url"] = song["url"] if song else ""
+                    NOW_PLAYING["pic"] = song["pic"] if song else ""
+                    NOW_PLAYING["lyric"] = song["lyric"] if song else []
+                if song:
+                    artist_txt = f"·{song['artist']}" if song.get("artist") else ""
+                    finish_reply(f"好嘞，给「{user}」点一首《{song['name']}》{artist_txt}～",
+                                 "默认", user, content, timings, emotion="happy")
+                else:
+                    finish_reply(f"「{kw}」我没搜到诶，换个歌名再试试？",
+                                 "默认", user, content, timings, emotion="thinking")
                 return
 
         # 直接念（进场/关注/点赞/守护/醒目留言等）
@@ -920,6 +1023,9 @@ class Handler(BaseHTTPRequestHandler):
                 d["last_danmaku_at"] = LAST_DANMAKU_TIME
                 d["started_at"] = STARTED_AT
                 d["model"] = CURRENT_MODEL
+                d["now_playing"] = NOW_PLAYING
+                d["usage"] = get_usage()
+                d["gift_total"] = sum(GIFT_BOARD.values())
                 d["gift_board"] = sorted(GIFT_BOARD.items(), key=lambda x: -x[1])[:10]
                 d["gift_log"] = list(GIFT_LOG)
                 d["queue"] = {"depth": len(QUEUE), **QUEUE_STATS}

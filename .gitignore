@@ -22,6 +22,7 @@ logs/
 *.log
 gift_board.json
 gift_board.json.tmp
+usage.json
 /piper_voices/
 .vscode/
 

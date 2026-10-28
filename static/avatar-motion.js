@@ -146,6 +146,7 @@
     this.nod = new Spring(0, 140);         // 点头冲量
     this.bodyX = new Spring(0, 9); this.bodyZ = new Spring(0, 9); this.bodyY = new Spring(0, 9);
     this.weightX = 0; this.nextWeightShift = now + rand(4, 8);
+    this.musicS = new Spring(0, 6);   // 音乐律动能量(0-1)的平滑值
     this.arm = { armL: new Spring(0, 30), armR: new Spring(0, 30), handL: new Spring(0, 40),
                  handR: new Spring(0, 40), shoulder: new Spring(0, 60) };
     this.gesture = null;     // {name, start, dur}
@@ -230,6 +231,7 @@
     this.mouth.target = this.speaking ? this.level : 0;
   };
   AvatarMotion.prototype.setThinking = function (on) { this.thinking = !!on; };
+  AvatarMotion.prototype.setMusic = function (v) { this.musicS.target = clamp(v, 0, 1); };
 
   AvatarMotion.prototype.setEmotion = function (name, seconds) {
     if (!EMOTIONS[name]) return;
@@ -407,6 +409,14 @@
     this.bodyX.target = hx * 0.35 + this.weightX;
     this.bodyZ.target = hz * 0.35 + this.weightX * 0.4;
     this.bodyY.target = (hy + nod) * 0.15;
+    // ---- 音乐律动：明显跳舞（能量由前端分析器喂入）
+    var mE = this.musicS.step(dt);
+    var bounce = 0.5 + 0.5 * Math.sin(now * 5.6);   // 鼓点弹跳(~0.9Hz)
+    var rock = Math.sin(now * 2.8);                  // 左右摇摆(~0.45Hz)
+    var twist = Math.sin(now * 3.9);                 // 扭身(~0.62Hz)
+    this.bodyY.target += mE * (4 + 16 * bounce);     // 上下弹(最高~20°)
+    this.bodyX.target += rock * mE * 20;             // 左右摆 ±20°
+    this.bodyZ.target += twist * mE * 14;            // 扭身 ±14°
     var bx = this.bodyX.step(dt), bz = this.bodyZ.step(dt), by = this.bodyY.step(dt);
 
     // ---- 手势
@@ -424,6 +434,13 @@
     if (sw > 0.01 && !locked) {
       g.handL += sw * (0.12 + 0.25 * this.levelFast) * (0.5 + 0.5 * noise(t * 1.3, 5.5));
       g.handR += sw * (0.12 + 0.25 * this.levelFast) * (0.5 + 0.5 * noise(t * 1.1, 7.7));
+    }
+    // 音乐律动：手臂随鼓点交替举臂大幅摆动
+    if (mE > 0.05) {
+      g.armL += bounce * mE * 1.0;
+      g.armR += (1 - bounce) * mE * 1.0;
+      g.handL += bounce * mE * 0.85;
+      g.handR += (1 - bounce) * mE * 0.85;
     }
     var arm = {};
     for (var ak in this.arm) { this.arm[ak].target = g[ak]; arm[ak] = this.arm[ak].step(dt); }
