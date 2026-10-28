@@ -26,6 +26,8 @@ try:
 except Exception:
     pass
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 # ---------------- 端点 ----------------
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -61,9 +63,14 @@ def timed(name, fn):
 
 
 def require(cond, msg):
+    """断言前置条件（API Key、必填参数等）。
+
+    必须抛普通异常，不能用 sys.exit()：bridge.py 的后台 worker 线程用
+    `except Exception` 兜底，而 SystemExit 继承自 BaseException 不会被捕获，
+    会直接打死 worker 线程且不写 LATEST 状态，表现为「服务活着但不再响应」。
+    """
     if not cond:
-        print(f"[FATAL] {msg}")
-        sys.exit(1)
+        raise RuntimeError(msg)
 
 
 # ---------------- 第 1 步：DeepSeek 回复 ----------------
@@ -186,7 +193,11 @@ def vidu_lipsync_wait(task_id: str):
 
 def download(url: str, out_dir: str) -> str:
     os.makedirs(out_dir, exist_ok=True)
-    name = url.split("/")[-1].split("?")[0] or "result.mp4"
+    # URL 尾段可能带反斜杠（Windows 分隔符）或 ..，只取纯文件名，避免写出目录
+    raw = url.split("/")[-1].split("?")[0]
+    name = os.path.basename(raw.replace("\\", "/"))
+    if not name or name in (".", ".."):
+        name = "result.mp4"
     path = os.path.join(out_dir, name)
     with requests.get(url, stream=True, timeout=300) as r:
         r.raise_for_status()
@@ -241,7 +252,7 @@ def main():
     local_path = None
     if not args.no_download:
         local_path, dt = timed("4.本地接收视频",
-                               lambda: download(video_url, "output"))
+                               lambda: download(video_url, os.path.join(BASE_DIR, "output")))
         if isinstance(local_path, Exception):
             print(f"[WARN] 下载失败：{local_path}")
             local_path = None
@@ -265,4 +276,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as e:   # require() 抛出的配置/前置条件错误
+        print(f"[FATAL] {e}")
+        sys.exit(1)
