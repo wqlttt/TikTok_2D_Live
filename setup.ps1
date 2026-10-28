@@ -136,12 +136,12 @@ $HasGo = [bool](Get-Command go -ErrorAction SilentlyContinue)
 if (-not $HasGo) { Warn "未找到 Go，douyinLive 将跳过编译（接真实弹幕前需自行安装 Go）" }
 
 # ---------------------------------------------------------------- 2. Python 依赖
-Info "安装 Python 依赖 (requests / python-dotenv)"
+Info "安装 Python 依赖（requirements.txt）"
 if ($DryRun) {
-    Write-Host "    (dry-run) pip install requests python-dotenv" -ForegroundColor DarkGray
+    Write-Host "    (dry-run) pip install -r requirements.txt" -ForegroundColor DarkGray
 } else {
-    $pipRc = Invoke-Native { & $PyCmd @PyArgs -m pip install -q --disable-pip-version-check requests python-dotenv }
-    if ($pipRc -ne 0) { Warn "pip 安装失败，请手动执行：python -m pip install requests python-dotenv" }
+    $pipRc = Invoke-Native { & $PyCmd @PyArgs -m pip install -q --disable-pip-version-check -r requirements.txt }
+    if ($pipRc -ne 0) { Warn "pip 安装失败，请手动执行：python -m pip install -r requirements.txt" }
 }
 
 # ---------------------------------------------------------------- 3. Live2D 运行库
@@ -151,18 +151,25 @@ $libs = [ordered]@{
     "live2d/cubism4.min.js"          = "https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"
     "live2d/live2dcubismcore.min.js" = "https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"
 }
+$libFail = 0
 foreach ($rel in $libs.Keys) {
     if ($DryRun) {
         Write-Host "    (dry-run) 下载 $rel" -ForegroundColor DarkGray
         continue
     }
-    New-Item -ItemType Directory -Path (Split-Path -Parent $rel) -Force | Out-Null
+    $dest = Join-Path $Root $rel
+    New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
     try {
-        Invoke-WebRequest -Uri $libs[$rel] -OutFile $rel -UseBasicParsing
+        Invoke-WebRequest -Uri $libs[$rel] -OutFile $dest -UseBasicParsing
         Info "  已下载 $rel"
     } catch {
-        Fail "下载 $rel 失败：$($_.Exception.Message)"
+        # 与脚本其余部分保持一致：单个资源失败只警告，不中断整体部署
+        $libFail++
+        Warn "下载 $rel 失败：$($_.Exception.Message)"
     }
+}
+if ($libFail -gt 0) {
+    Warn "有 $libFail 个运行库未下载成功，虚拟人页面可能无法加载；重跑本脚本可补齐"
 }
 
 # ---------------------------------------------------------------- 4. Live2D 模型

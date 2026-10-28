@@ -24,10 +24,6 @@ gift_board.json
 gift_board.json.tmp
 /piper_voices/
 .vscode/
-deliverables/
-
-# ============ 本地工作区数据 ============
-.workbuddy-ai/
 
 # ============ macOS ============
 .DS_Store
