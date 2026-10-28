@@ -83,13 +83,35 @@ BOUND_TO_LOOPBACK = HOST in LOOPBACK_HOSTS
 ALLOWED_HOSTS = set(LOOPBACK_HOSTS)
 if HOST and HOST not in ("0.0.0.0", "::"):
     ALLOWED_HOSTS.add(HOST)
-# 只有显式暴露到局域网时才接受本机网卡 IP，避免「已防护」的错觉
+# 只有显式暴露到局域网时才接受本机网卡 IP，避免「已防护」的错觉。
+# 在启动时（鉴权检查之后）由 discover_local_ips() 填充，不在 import 阶段做：
+# gethostbyname_ex 没有超时，主机名解析不了的机器（如 GitHub macOS runner）
+# 会卡十几秒，连「拒绝启动」的检查都被拖住。
 LOCAL_IPS = set()
-if not BOUND_TO_LOOPBACK:
+
+
+def discover_local_ips(wait=2.0):
+    """探测本机网卡 IP 写入 LOCAL_IPS，最多阻塞 wait 秒。"""
+    # 主网卡 IP：UDP connect 只选路由、不发包、不查 DNS，瞬间返回
     try:
-        LOCAL_IPS = set(socket.gethostbyname_ex(socket.gethostname())[2])
-    except Exception:  # 离线或网络异常时不阻断启动
-        LOCAL_IPS = set()
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.255.255.255", 1))
+            LOCAL_IPS.add(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        pass
+
+    def _by_hostname():   # 多网卡时补全其它 IP；可能很慢，放后台
+        try:
+            LOCAL_IPS.update(socket.gethostbyname_ex(socket.gethostname())[2])
+        except Exception:  # noqa: BLE001  离线或解析失败不阻断启动
+            pass
+
+    t = threading.Thread(target=_by_hostname, daemon=True)
+    t.start()
+    t.join(wait)
 CHAT_TTL = float(env("BRIDGE_CHAT_TTL", "30") or 30)         # 普通弹幕排队超过 N 秒就不回了
 GIFT_TTL = float(env("BRIDGE_GIFT_TTL", "120") or 120)       # 礼物感谢保留更久
 STREAM_REPLY = env("DEEPSEEK_STREAM", "1").lower() not in ("0", "false", "no", "off")
@@ -1097,6 +1119,8 @@ def check_auth_config():
 if __name__ == "__main__":
     configure_console()   # Windows 下输出重定向时不因 GBK 编码崩溃
     check_auth_config()
+    if not BOUND_TO_LOOPBACK:
+        discover_local_ips()
     if TTS_BACKEND_ERROR:
         # 支持平台上没有可用 TTS 就是配置错误，直接退出比跑起来再哑掉好。
         # Linux 只用于 CI 跑接口/单测（既无 say 也无 sapi），放行但明确告警，
