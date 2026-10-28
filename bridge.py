@@ -20,12 +20,23 @@
 import json
 import os
 import re
-import subprocess
+import socket
 import threading
 import time
 import traceback
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+# 跨平台 TTS：piper / macOS say / Windows sapi，按 TTS_BACKEND 或平台自动选择
+from tts_backend import (
+    BASE_DIR,
+    configure_console,
+    pick_local_voice,
+    resolve_backend,
+    synthesize as tts_synthesize,
+    warmup as tts_warmup,
+)
 
 # 复用验证脚本里的链路函数
 from verify_pipeline import (
@@ -42,6 +53,19 @@ HOST = env("BRIDGE_HOST", "127.0.0.1")
 PORT = int(env("BRIDGE_PORT", "8000") or 8000)
 MIN_INTERVAL = float(env("BRIDGE_MIN_INTERVAL", "3") or 3)   # 两条回复最小间隔(秒)
 MAX_QUEUE = int(env("BRIDGE_MAX_QUEUE", "20") or 20)
+MAX_BODY = int(env("BRIDGE_MAX_BODY", "8192") or 8192)       # 请求体上限(字节)
+BRIDGE_TOKEN = env("BRIDGE_TOKEN", "")   # 可选；设了才校验 X-Bridge-Token
+
+# Host / Origin 白名单：只接受本机访问，阻断 DNS rebinding 与跨站请求。
+# 攻击者可以让受害者浏览器去请求 http://evil.example:8000/（解析到 127.0.0.1），
+# 借同源策略之外的路径打本地服务，进而触发 DeepSeek 计费调用。
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+if HOST not in ("", "0.0.0.0", "::"):
+    ALLOWED_HOSTS.add(HOST)
+try:
+    LOCAL_IPS = set(socket.gethostbyname_ex(socket.gethostname())[2])
+except Exception:  # 离线或网络异常时不阻断启动
+    LOCAL_IPS = set()
 
 LOCK = threading.Lock()
 QUEUE = deque()
@@ -54,7 +78,11 @@ LATEST = {
 _last_run = 0.0
 _last_content = ""
 LATEST_AUDIO = ""          # 本地 TTS 产出的最新 wav 路径
-TTS_BACKEND = env("TTS_BACKEND", "local").lower()   # local(本地 say) | vidu(云端对口型)
+try:
+    # piper(本地) / say(macOS) / sapi(Windows) / vidu(云端对口型) / auto(按平台探测)
+    TTS_BACKEND = resolve_backend()
+except (ValueError, RuntimeError) as _e:
+    raise SystemExit(f"[配置错误] TTS_BACKEND 解析失败：{_e}")
 HISTORY = deque(maxlen=int(env("HISTORY_TURNS", "8") or 8))   # 记忆最近 N 轮对话，让回复能接上下文
 USER_MEMORY = {}           # 昵称 -> deque([(弹幕, 回复), ...]) 按人记忆，提升用户亲和性
 REPLIES = deque(maxlen=30) # 已完成的回复队列（供前端排队播放，避免下一条覆盖上一条）
@@ -134,75 +162,6 @@ def filter_reply(text):
     return text
 
 
-def say_tts(text, voice):
-    """本地 TTS：调用 macOS `say`，直接输出 WAV。"""
-    os.makedirs("audio", exist_ok=True)
-    out = os.path.join("audio", f"reply_{int(time.time() * 1000)}.wav")
-    subprocess.run(
-        ["say", "-v", voice, "-o", out,
-         "--file-format=WAVE", "--data-format=LEI16@22050", text],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return out
-
-
-_PIPER_VOICE = None
-
-
-def _load_piper():
-    """懒加载 Piper 音色（zh_CN-xiao_ya），只加载一次。"""
-    global _PIPER_VOICE
-    if _PIPER_VOICE is None:
-        from piper import PiperVoice
-        from pathlib import Path
-        _PIPER_VOICE = PiperVoice.load(
-            Path("piper_voices/zh_CN-xiao_ya-medium.onnx"),
-            download_dir=Path("piper_voices"),
-        )
-    return _PIPER_VOICE
-
-
-def piper_tts(text):
-    """本地 Piper TTS：预热后极快（约 20 倍实时）。输出 22050Hz wav。"""
-    voice = _load_piper()
-    import numpy as np
-    import wave
-    os.makedirs("audio", exist_ok=True)
-    out = os.path.join("audio", f"reply_{int(time.time() * 1000)}.wav")
-    chunks = list(voice.synthesize(text))
-    pcm = np.concatenate([c.audio_int16_array for c in chunks])
-    with wave.open(out, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(22050)
-        w.writeframes(pcm.astype(np.int16).tobytes())
-    return out
-
-
-def _warmup_piper():
-    """后台预热：加载模型 + 跑一次空合成，避免第一条回复卡顿。"""
-    try:
-        v = _load_piper()
-        list(v.synthesize("。"))
-    except Exception:
-        pass
-
-
-def pick_say_voice(content):
-    """本地模式：按弹幕关键词选择 macOS `say` 音色，返回 (voice, 标签)。"""
-    default = env("SAY_VOICE", "Tingting")
-    raw = env("SAY_VOICE_MAP", "")
-    mapping = {}
-    if raw:
-        try:
-            mapping = json.loads(raw)
-        except Exception:
-            mapping = {}
-    for label in sorted(mapping, key=len, reverse=True):
-        if label and label in content:
-            return mapping[label], label
-    return default, "默认"
-
-
 def user_context(nick):
     """按昵称取该观众最近几轮对话，让数字人记得「上次和这个人聊过什么」。"""
     mem = USER_MEMORY.get(nick)
@@ -242,13 +201,9 @@ def finish_reply(reply, voice_label, user, content, timings, say_voice=None):
     reply = filter_reply(reply)   # 本地敏感词兜底
     text = strip_emoji(reply)
     t0 = time.time()
-    if TTS_BACKEND == "piper":
-        try:
-            wav_path = piper_tts(text)
-        except Exception:
-            wav_path = say_tts(text, say_voice or env("SAY_VOICE", "Tingting"))
-    else:
-        wav_path = say_tts(text, say_voice or env("SAY_VOICE", "Tingting"))
+    # 后端选择统一由 tts_backend 负责（piper / say / sapi），这里不再分支，
+    # 否则新增后端时容易漏改某条分支而落到 macOS 专属的 say 上。
+    wav_path = tts_synthesize(text, say_voice or None)
     timings["tts"] = round(time.time() - t0, 2)
     with LOCK:
         LATEST_AUDIO = wav_path
@@ -305,8 +260,8 @@ def process_one(item):
         if user:
             USER_MEMORY.setdefault(user, deque(maxlen=3)).append((content, reply))
 
-        if TTS_BACKEND in ("local", "piper"):
-            say_voice, voice_label = pick_say_voice(content)
+        if TTS_BACKEND != "vidu":
+            say_voice, voice_label = pick_local_voice(content)
             finish_reply(reply, voice_label, user, content, timings, say_voice=say_voice)
         else:
             voice_id, voice_label = pick_voice(content)
@@ -327,7 +282,7 @@ def process_one(item):
             timings["render_wait"] = round(time.time() - t0, 2)
 
             t0 = time.time()
-            local_path = download(video_url, "output")
+            local_path = download(video_url, os.path.join(BASE_DIR, "output"))
             timings["download"] = round(time.time() - t0, 2)
 
             with LOCK:
@@ -403,10 +358,9 @@ def enqueue(item):
     return True
 
 
-_here = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(_here, "avatar.html"), encoding="utf-8") as _f:
+with open(os.path.join(BASE_DIR, "avatar.html"), encoding="utf-8") as _f:
     AVATAR_HTML = _f.read()
-LIVE2D_DIR = os.path.join(_here, "live2d")
+LIVE2D_DIR = os.path.join(BASE_DIR, "live2d")
 
 
 PREVIEW_HTML = """<!doctype html>
@@ -465,7 +419,37 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # ---------- 访问控制 ----------
+
+    def _host_ok(self):
+        """校验 Host 头（阻断 DNS rebinding）。"""
+        raw = (self.headers.get("Host") or "").strip()
+        if not raw:
+            return True                    # HTTP/1.0 客户端不带 Host，放行避免误伤
+        if raw.startswith("["):            # [::1] 或 [::1]:8000 —— 不能按冒号切
+            end = raw.find("]")
+            host = raw[1:end] if end > 0 else raw
+        else:
+            host = raw.rsplit(":", 1)[0]
+        return host.strip().lower() in ALLOWED_HOSTS or host.strip() in LOCAL_IPS
+
+    def _origin_ok(self):
+        """校验 Origin（阻断跨站 POST）。非浏览器客户端不带 Origin，放行。"""
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        try:
+            host = (urlsplit(origin).hostname or "").lower()
+        except ValueError:
+            return False
+        return host in ALLOWED_HOSTS or host in LOCAL_IPS
+
+    def _deny(self):
+        return self._send(403, {"error": "forbidden: host/origin not allowed"})
+
     def do_GET(self):
+        if not self._host_ok():
+            return self._deny()
         if self.path in ("/", "/avatar"):
             return self._send(200, AVATAR_HTML, "text/html; charset=utf-8")
         if self.path == "/api/state":
@@ -520,12 +504,23 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._host_ok() or not self._origin_ok():
+            return self._deny()
         if self.path == "/api/danmaku":
+            if BRIDGE_TOKEN:
+                if (self.headers.get("X-Bridge-Token") or "") != BRIDGE_TOKEN:
+                    return self._send(401, {"error": "bad token"})
             try:
-                n = int(self.headers.get("Content-Length", 0))
+                n = int(self.headers.get("Content-Length", 0) or 0)
+                if n <= 0:
+                    return self._send(400, {"error": "empty body"})
+                if n > MAX_BODY:
+                    return self._send(413, {"error": "payload too large"})
                 body = json.loads(self.rfile.read(n) or b"{}")
             except Exception:
                 return self._send(400, {"error": "bad json"})
+            if not isinstance(body, dict):
+                return self._send(400, {"error": "json object required"})
             kind = (body.get("kind") or "").strip()
             priority = (body.get("priority") or "normal").strip()
             if kind == "gift":
@@ -559,8 +554,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    if TTS_BACKEND == "piper":
-        _warmup_piper()  # 同步预热（阻塞几秒，避免与 worker 线程竞争加载 g2pw 模型）
+    configure_console()   # Windows 下输出重定向时不因 GBK 编码崩溃
+    tts_warmup(TTS_BACKEND)  # Piper 预热（阻塞几秒，避免与 worker 线程竞争加载模型）
     threading.Thread(target=worker, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"数字人桥已启动：http://{HOST}:{PORT}")
@@ -568,7 +563,9 @@ if __name__ == "__main__":
     print(f"  - 收弹幕：     POST http://{HOST}:{PORT}/api/danmaku")
     print(f"  - 查状态：     GET  http://{HOST}:{PORT}/api/state")
     print(f"  - 本地音频：   GET  http://{HOST}:{PORT}/audio")
-    print(f"  渲染后端 TTS_BACKEND = {TTS_BACKEND}（local=本地 say / vidu=云端对口型）")
+    print(f"  TTS 后端 = {TTS_BACKEND}"
+          f"（piper=本地模型 / say=macOS / sapi=Windows / vidu=云端对口型）")
+    print(f"  工作目录 = {BASE_DIR}")
     print("提示：开播前请确认 .env 已填 DeepSeek Key。")
     try:
         srv.serve_forever()
