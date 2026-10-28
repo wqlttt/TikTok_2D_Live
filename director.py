@@ -60,7 +60,17 @@ _DEFAULT_DEFAULTS = {
     "cooldown": 0,
     "user_cooldown": 0,
     "interruptible": True,
+    # 规则命中全局冷却时怎么办：
+    #   fallthrough  继续尝试下一条匹配规则（最终落到兜底规则），不丢礼物
+    #   queue        仍用本规则，进队列等当前演出结束（大礼物用，保证每个都有演出）
+    "on_cooldown": "fallthrough",
+    # 排队中的动作最多等多久（秒），过期丢弃——20 秒后的感谢观众早看不到了
+    "queue_ttl": 10,
 }
+
+_ON_COOLDOWN = ("fallthrough", "queue")
+_EVENT_DEDUPE_TTL = 120.0   # event_id 去重窗口（秒）
+_EVENT_DEDUPE_MAX = 2000
 
 
 class _SafeDict(dict):
@@ -142,6 +152,7 @@ class GiftDirector:
         self._queue: List[Dict[str, Any]] = []
         self._next_at: Dict[str, float] = {}
         self._user_next_at: Dict[str, float] = {}
+        self._seen_events: Dict[str, float] = {}
         self._seq = 0
         self.last_error = ""
 
@@ -189,6 +200,11 @@ class GiftDirector:
             )
             rule["interruptible"] = bool(rule.get("interruptible",
                                                   defaults.get("interruptible", True)))
+            on_cd = str(rule.get("on_cooldown")
+                        or defaults.get("on_cooldown") or "fallthrough").strip().lower()
+            rule["on_cooldown"] = on_cd if on_cd in _ON_COOLDOWN else "fallthrough"
+            rule["queue_ttl"] = max(0.5, _as_float(rule.get("queue_ttl"),
+                                                   _as_float(defaults.get("queue_ttl"), 10.0)))
             rule["match"] = rule.get("match") if isinstance(rule.get("match"), dict) else {}
             timeline = _normalize_timeline(rule.get("timeline") or rule.get("steps") or [])
             rule["timeline"] = timeline
@@ -212,6 +228,7 @@ class GiftDirector:
             self._queue = []
             self._next_at = {}
             self._user_next_at = {}
+            self._seen_events = {}
             self.last_error = ""
 
     @staticmethod
@@ -274,11 +291,26 @@ class GiftDirector:
             return False
         return True
 
-    def _select(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _select(self, event: Dict[str, Any], now: float):
+        """按优先级挑规则，返回 (rule, queue_only)；没有可用规则返回 (None, False)。
+
+        - 用户冷却（防同一人刷屏）命中 -> 跳过该规则，试下一条
+        - 全局冷却命中：
+            on_cooldown=queue        -> 仍用该规则，但只能排队，不立即播/不打断
+            on_cooldown=fallthrough  -> 试下一条（通常最终落到兜底规则）
+        这样礼物不会因为「同类演出刚播过」而被整个丢掉。
+        """
         for rule in self._rules:
-            if self._matches(rule, event):
-                return rule
-        return None
+            if not self._matches(rule, event):
+                continue
+            if not self._user_cooldown_ok(rule, event, now):
+                continue
+            if now < self._next_at.get(rule["id"], 0.0):
+                if rule["on_cooldown"] == "queue":
+                    return rule, True
+                continue
+            return rule, False
+        return None, False
 
     # ------------------------------------------------------------- scheduling
 
@@ -287,12 +319,26 @@ class GiftDirector:
             self._current = None
             self._current_until = 0.0
 
-    def _cooldown_ok(self, rule: Dict[str, Any], event: Dict[str, Any], now: float) -> bool:
-        rule_id = rule["id"]
-        if now < self._next_at.get(rule_id, 0.0):
-            return False
-        user_key = f"{rule_id}|{event['nick']}"
+    def _user_cooldown_ok(self, rule: Dict[str, Any], event: Dict[str, Any],
+                          now: float) -> bool:
+        user_key = f"{rule['id']}|{event['nick']}"
         return now >= self._user_next_at.get(user_key, 0.0)
+
+    def _seen(self, event_id: str, now: float) -> bool:
+        """event_id 去重：抖音连击会重复推送同一事件。"""
+        if not event_id:
+            return False
+        if len(self._seen_events) > _EVENT_DEDUPE_MAX:
+            cutoff = now - _EVENT_DEDUPE_TTL
+            self._seen_events = {k: t for k, t in self._seen_events.items() if t >= cutoff}
+        last = self._seen_events.get(event_id)
+        if last is not None and now - last < _EVENT_DEDUPE_TTL:
+            return True
+        self._seen_events[event_id] = now
+        return False
+
+    def _drop_expired(self, now: float) -> None:
+        self._queue = [p for p in self._queue if p.get("_expires_at", now + 1) > now]
 
     def _mark_cooldown(self, rule: Dict[str, Any], event: Dict[str, Any], now: float) -> None:
         if rule["cooldown"] > 0:
@@ -332,8 +378,10 @@ class GiftDirector:
             "timeline": _render(rule["timeline"], ctx),
         }
 
-    def _enqueue(self, plan: Dict[str, Any]) -> bool:
-        plan["_queued_at"] = self._clock()
+    def _enqueue(self, plan: Dict[str, Any], rule: Dict[str, Any], now: float) -> bool:
+        plan["_queued_at"] = now
+        plan["_expires_at"] = now + rule["queue_ttl"]
+        self._drop_expired(now)
         if len(self._queue) < self._max_queue:
             self._queue.append(plan)
             return True
@@ -362,25 +410,29 @@ class GiftDirector:
         now = self._clock()
         normalized = self.normalize_event(event)
         with self._lock:
+            if self._seen(normalized["event_id"], now):
+                return None
             self._expire(now)
-            rule = self._select(normalized)
-            if rule is None or not self._cooldown_ok(rule, normalized, now):
+            rule, queue_only = self._select(normalized, now)
+            if rule is None:
                 return None
 
             plan = self._build_plan(rule, normalized, now)
-            self._mark_cooldown(rule, normalized, now)
 
             if self._current is not None:
-                # 高优先级且当前演出允许打断 -> 立即替换
-                if plan["priority"] > self._current["priority"] and self._current.get("interruptible", True):
+                # 高优先级且当前演出允许打断 -> 立即替换。
+                # 冷却中的 queue 规则不打断，只排队（冷却的意义就是不连着炸屏）。
+                if (not queue_only
+                        and plan["priority"] > self._current["priority"]
+                        and self._current.get("interruptible", True)):
                     plan["interrupt"] = True
-                    self._current = plan
-                    self._current_until = now + plan["duration"]
-                    return self._public(plan)
+                else:
+                    if self._enqueue(plan, rule, now):
+                        self._mark_cooldown(rule, normalized, now)
+                    return None
+            # 台上空闲：直接播（冷却中的 queue 规则也不必空等）
 
-                self._enqueue(plan)
-                return None
-
+            self._mark_cooldown(rule, normalized, now)
             self._current = plan
             self._current_until = now + plan["duration"]
             return self._public(plan)
@@ -390,6 +442,7 @@ class GiftDirector:
         now = self._clock()
         with self._lock:
             self._expire(now)
+            self._drop_expired(now)
             if self._current is not None or not self._queue:
                 return None
             self._queue.sort(key=lambda p: (-p["priority"], p.get("_queued_at", 0.0)))

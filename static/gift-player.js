@@ -25,6 +25,8 @@
     this.duration = 0;
     this._timers = [];
     this._token = 0;
+    // 一条动作自然播完（非 stop 打断）时回调，供外部推进前端队列
+    this.onFinish = typeof options.onFinish === "function" ? options.onFinish : null;
 
     if (options.model) this.setModel(options.model, options.stage);
     if (global.GiftEffects) global.GiftEffects.init(this.stage);
@@ -106,6 +108,9 @@
     }
     if (global.GiftEffects) global.GiftEffects.clear();
     if (hadMotion) this._resetPose();
+    if (this.onFinish) {
+      try { this.onFinish(); } catch (e) { console.warn("[GiftPlayer] onFinish failed:", e); }
+    }
   };
 
   GiftPlayer.prototype._exec = function (step) {

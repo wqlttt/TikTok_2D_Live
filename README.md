@@ -207,6 +207,17 @@ curl -X POST http://127.0.0.1:8000/api/danmaku \
 
 匹配按 `priority` 从高到低；`cooldown` / `user_cooldown` 控制频率；`interruptible` 控制能否被更大礼物打断。
 
+**礼物不会因冷却被丢掉**：
+
+- `user_cooldown` 命中（同一人刷屏）→ 跳过该规则，尝试下一条匹配规则
+- `cooldown` 命中（同类演出刚播过）→ 看 `on_cooldown`：
+  - `fallthrough`（默认）：降级到下一条匹配规则，最终落到 `fallback`
+  - `queue`：仍用本规则，排队等当前演出结束（`large_gift` 用这个，保证每个大礼物都有完整演出）
+- 排队动作超过 `queue_ttl` 秒（默认 10，大礼物 60）仍没轮到则丢弃，避免过时的感谢
+- 请求里带 `event_id` 时按它去重（抖音连击会重复推送同一事件）
+
+`/api/state?since=<action_seq>` 只返回该序号之后的动作，前端轮询用它减小负载。
+
 `match` 支持：`names` / `exclude_names`（礼物名包含匹配）、`min_value` / `max_value`、`min_count` / `max_count`、`min_combo` / `max_combo`。
 
 ### 大礼物为什么不占 Live2D 动作组

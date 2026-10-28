@@ -155,6 +155,77 @@ class GiftDirectorTest(unittest.TestCase):
         self.assertNotIn("motion", types)
         self.assertIn("effect", types)
 
+    def test_cooldown_falls_through_to_lower_rule(self):
+        # small 冷却中：第二个小礼物不应被丢，而是落到 fallback 排队
+        self.director.ingest(self.gift(nick="A"))
+        self.assertIsNone(self.director.ingest(self.gift(nick="B")))
+        self.assertEqual(self.director.snapshot()["queue_depth"], 1)
+        self.clock.advance(2.1)
+        queued = self.director.tick()
+        self.assertEqual(queued["rule_id"], "fallback")
+        self.assertEqual(queued["gift"]["nick"], "B")
+
+    def test_queue_rule_on_cooldown_is_queued_not_dropped(self):
+        config = make_config()
+        config["rules"][0].update({"cooldown": 20, "on_cooldown": "queue", "queue_ttl": 60})
+        director = GiftDirector(config=config, clock=self.clock)
+        first = director.ingest(self.gift(nick="A", value=520, gift="嘉年华"))
+        self.assertEqual(first["rule_id"], "large")
+        self.clock.advance(1)
+        self.assertIsNone(director.ingest(self.gift(nick="B", value=520, gift="嘉年华")))
+        self.clock.advance(4.1)
+        second = director.tick()
+        self.assertIsNotNone(second)
+        self.assertEqual(second["rule_id"], "large")
+        self.assertEqual(second["gift"]["nick"], "B")
+
+    def test_queue_rule_on_cooldown_plays_when_idle(self):
+        config = make_config()
+        config["rules"][0].update({"cooldown": 20, "on_cooldown": "queue"})
+        director = GiftDirector(config=config, clock=self.clock)
+        director.ingest(self.gift(nick="A", value=520))
+        self.clock.advance(6)   # A 已播完，但仍在 20s 冷却内
+        plan = director.ingest(self.gift(nick="B", value=520))
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["rule_id"], "large")
+
+    def test_queue_rule_on_cooldown_does_not_interrupt(self):
+        config = make_config()
+        config["rules"][0].update({"cooldown": 20, "on_cooldown": "queue"})
+        director = GiftDirector(config=config, clock=self.clock)
+        director.ingest(self.gift(nick="A", value=520))
+        self.clock.advance(6)
+        director.ingest(self.gift(nick="S", value=50))          # medium 在台上
+        self.assertIsNone(director.ingest(self.gift(nick="B", value=520)))
+        self.assertEqual(director.snapshot()["current"]["rule_id"], "medium")
+
+    def test_queued_plan_expires(self):
+        self.director.ingest(self.gift(value=100, gift="嘉年华"))   # 5s 不可打断
+        self.director.ingest(self.gift(value=50, nick="B"))           # 排队，ttl 默认 10s
+        self.clock.advance(11)
+        self.assertIsNone(self.director.tick())
+        self.assertEqual(self.director.snapshot()["queue_depth"], 0)
+
+    def test_event_id_dedupe(self):
+        self.assertIsNotNone(self.director.ingest(self.gift(value=100, event_id="e1")))
+        self.clock.advance(6)
+        self.assertIsNone(self.director.ingest(self.gift(value=100, event_id="e1")))
+        self.assertIsNotNone(self.director.ingest(self.gift(value=100, event_id="e2")))
+
+    def test_default_config_busy_room_no_drop(self):
+        director = GiftDirector(clock=self.clock)
+        director.ingest({"nick": "A", "gift": "嘉年华", "value": 520})
+        self.clock.advance(1)
+        director.ingest({"nick": "A", "gift": "嘉年华", "value": 520})  # 同一人再送
+        director.ingest({"nick": "B", "gift": "嘉年华", "value": 520})
+        played = []
+        for _ in range(40):
+            self.clock.advance(0.5)
+            plan = director.tick()
+            if plan:
+                played.append((plan["rule_id"], plan["gift"]["nick"]))
+        self.assertEqual(played, [("large_gift", "A"), ("large_gift", "B")])
+
     def test_video_step_is_preserved(self):
         config = make_config()
         config["rules"].insert(0, {
