@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import traceback
+import socketserver
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -1116,6 +1117,21 @@ def check_auth_config():
             "  生成：python -c \"import secrets;print(secrets.token_urlsafe(24))\"")
 
 
+class BridgeServer(ThreadingHTTPServer):
+    """跳过 HTTPServer.server_bind 里的 socket.getfqdn()。
+
+    getfqdn 会做反向 DNS 解析且没有超时；主机名/反解不通的机器（如 GitHub
+    macOS runner）上 bind 会卡几十秒才开始监听。server_name 只用于 CGI 环境变量，
+    本服务用不到，直接用绑定地址即可。
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
 if __name__ == "__main__":
     configure_console()   # Windows 下输出重定向时不因 GBK 编码崩溃
     check_auth_config()
@@ -1137,7 +1153,7 @@ if __name__ == "__main__":
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=director_tick_loop, daemon=True).start()
     threading.Thread(target=gift_board_saver, daemon=True).start()
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    srv = BridgeServer((HOST, PORT), Handler)
     print(f"数字人桥已启动：http://{HOST}:{PORT}")
     print(f"  - 虚拟人页面： http://{HOST}:{PORT}/")
     print(f"  - 收弹幕：     POST http://{HOST}:{PORT}/api/danmaku")

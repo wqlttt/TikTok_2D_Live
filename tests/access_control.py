@@ -30,6 +30,7 @@
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -80,12 +81,33 @@ def wait_port(port, timeout=20.0, host="127.0.0.1"):
 def boot(port, extra):
     env = dict(os.environ)
     env.update({"BRIDGE_PORT": str(port), "BRIDGE_MIN_INTERVAL": "0",
-                "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8:replace"})
+                "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8:replace",
+                "PYTHONUNBUFFERED": "1"})   # 被结束时输出不丢，失败时才能看到原因
     env.pop("DEEPSEEK_API_KEY", None)      # 不产生任何计费调用
     env.update(extra)
     return subprocess.Popen([sys.executable, BRIDGE], cwd=ROOT, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, encoding="utf-8", errors="replace")
+
+
+def boot_output(p, limit=600):
+    """启动失败时取进程输出，便于在 CI 上定位原因（会先结束进程）。"""
+    try:
+        if p.poll() is None and os.name != "nt":
+            # 先发 SIGINT：卡在启动阶段时 Python 会打印 KeyboardInterrupt 回溯，直接看到卡在哪
+            p.send_signal(signal.SIGINT)
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        if p.poll() is None:
+            p.terminate()
+            p.wait(timeout=10)
+        out = p.stdout.read() if p.stdout else ""
+    except Exception as e:  # noqa: BLE001
+        out = "<读取输出失败：%s>" % e
+    out = (out or "").strip().replace("\n", " | ")
+    return " rc=%s 输出：%s" % (p.returncode, out[-limit:] or "<空>")
 
 
 def stop(p):
@@ -185,7 +207,7 @@ def case_origin_port(port):
     p = boot(port, {"BRIDGE_HOST": "127.0.0.1", "BRIDGE_TOKEN": ""})
     try:
         if not wait_port(port):
-            return check("Origin 端口校验", False, "服务未启动")
+            return check("Origin 端口校验", False, "服务未启动" + boot_output(p))
         h = "127.0.0.1:%d" % port
         head = raw_post(port, {"kind": "speak", "text": "op"}, h,
                         origin="http://127.0.0.1:9999")
@@ -208,7 +230,7 @@ def case_token_nonloopback(port):
     p = boot(port, {"BRIDGE_HOST": "0.0.0.0", "BRIDGE_TOKEN": "s3cret-token-0123456789"})
     try:
         if not wait_port(port, host=ip):
-            return check("非回环令牌校验", False, "服务未启动（%s:%d）" % (ip, port))
+            return check("非回环令牌校验", False, "服务未启动（%s:%d）" % (ip, port) + boot_output(p))
         spoof = "127.0.0.1:%d" % port        # 伪造 Host 绕过 rebinding 检查
 
         head = raw_post(port, {"kind": "speak", "text": "no-token"},
@@ -252,7 +274,7 @@ def case_page_no_token(port):
     p = boot(port, {"BRIDGE_HOST": "0.0.0.0", "BRIDGE_TOKEN": TOKEN})
     try:
         if not wait_port(port, host=ip):
-            return check("页面不泄漏令牌", False, "服务未启动")
+            return check("页面不泄漏令牌", False, "服务未启动" + boot_output(p))
         spoof = "127.0.0.1:%d" % port
         head, body = raw_get(port, "/", spoof, dst=ip)
         check("非回环 GET / 无令牌 -> 401", " 401 " in head, head)
@@ -284,7 +306,7 @@ def case_no_secret_in_unauthorized(port):
     p = boot(port, {"BRIDGE_HOST": "0.0.0.0", "BRIDGE_TOKEN": TOKEN})
     try:
         if not wait_port(port, host=ip):
-            return check("未授权响应不含令牌", False, "服务未启动")
+            return check("未授权响应不含令牌", False, "服务未启动" + boot_output(p))
         spoof = "127.0.0.1:%d" % port
         targets = ["/", "/avatar", "/api/state", "/audio", "/audio?seq=1",
                    "/video", "/live2d/x.png", "/no-such-endpoint"]
@@ -381,7 +403,7 @@ def case_referrer_policy(port):
     p = boot(port, {"BRIDGE_HOST": "127.0.0.1", "BRIDGE_TOKEN": ""})
     try:
         if not wait_port(port):
-            return check("Referrer 策略", False, "服务未启动")
+            return check("Referrer 策略", False, "服务未启动" + boot_output(p))
 
         head, body = raw_get(port, "/", "127.0.0.1:%d" % port)
         if " 200 " not in head:
@@ -435,7 +457,7 @@ def case_explicit_optin(port):
                     "BRIDGE_ALLOW_UNAUTHENTICATED": "1"})
     try:
         if not wait_port(port):
-            return check("显式放弃鉴权后可启动", False, "服务未启动")
+            return check("显式放弃鉴权后可启动", False, "服务未启动" + boot_output(p))
         check("BRIDGE_ALLOW_UNAUTHENTICATED=1 可启动", True)
         head = raw_post(port, {"kind": "speak", "text": "optin"},
                         "127.0.0.1:%d" % port)
