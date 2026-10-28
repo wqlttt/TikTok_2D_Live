@@ -134,7 +134,7 @@ class GiftDirectorTest(unittest.TestCase):
 
     def test_default_config_combo_rule(self):
         director = GiftDirector()
-        plan = director.ingest({"nick": "小红", "gift": "玫瑰", "count": 1,
+        plan = director.ingest({"nick": "小红", "gift": "棒棒糖", "count": 1,
                                 "value": 1, "combo": 10})
         self.assertIsNotNone(plan)
         self.assertEqual(plan["rule_id"], "combo_10")
@@ -214,10 +214,10 @@ class GiftDirectorTest(unittest.TestCase):
 
     def test_default_config_busy_room_no_drop(self):
         director = GiftDirector(clock=self.clock)
-        director.ingest({"nick": "A", "gift": "嘉年华", "value": 520})
+        director.ingest({"nick": "A", "gift": "神秘礼物", "value": 520})
         self.clock.advance(1)
-        director.ingest({"nick": "A", "gift": "嘉年华", "value": 520})  # 同一人再送
-        director.ingest({"nick": "B", "gift": "嘉年华", "value": 520})
+        director.ingest({"nick": "A", "gift": "神秘礼物", "value": 520})  # 同一人再送
+        director.ingest({"nick": "B", "gift": "神秘礼物", "value": 520})
         played = []
         for _ in range(40):
             self.clock.advance(0.5)
