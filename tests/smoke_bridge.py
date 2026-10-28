@@ -30,6 +30,11 @@ except ImportError:
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BRIDGE = os.path.join(ROOT, "bridge.py")
 
+# 关掉 trust_env：本机若设了 HTTP_PROXY/HTTPS_PROXY，requests 会把发往
+# 127.0.0.1 的请求也丢给代理，导致 ProxyError 而不是真正测试本地服务。
+SESSION = requests.Session()
+SESSION.trust_env = False
+
 RESULTS = []
 
 
@@ -107,13 +112,13 @@ def main():
         check("服务启动", True)
 
         # ---------- 1. 首页 ----------
-        r = requests.get(base + "/", timeout=10)
+        r = SESSION.get(base + "/", timeout=10)
         check("GET / 返回 Live2D 页面",
               r.status_code == 200 and "Live2D" in r.text,
               "status=%d len=%d" % (r.status_code, len(r.text)))
 
         # ---------- 2. 状态接口 ----------
-        r = requests.get(base + "/api/state", timeout=10)
+        r = SESSION.get(base + "/api/state", timeout=10)
         st = r.json()
         check("GET /api/state 结构正确",
               r.status_code == 200 and "status" in st and "replies" in st,
@@ -121,7 +126,7 @@ def main():
 
         # ---------- 3. 投递一条「直接朗读」（不经过 DeepSeek） ----------
         text = "宝子们晚上好呀，这是跨平台测试😆"
-        r = requests.post(base + "/api/danmaku",
+        r = SESSION.post(base + "/api/danmaku",
                           json={"text": text, "kind": "speak"}, timeout=10)
         body = r.json()
         check("POST /api/danmaku 入队", r.status_code == 200 and body.get("queued"),
@@ -131,7 +136,7 @@ def main():
         deadline = time.time() + 60
         state = {}
         while time.time() < deadline:
-            state = requests.get(base + "/api/state", timeout=10).json()
+            state = SESSION.get(base + "/api/state", timeout=10).json()
             if state.get("status") in ("done", "error"):
                 break
             time.sleep(0.5)
@@ -148,7 +153,7 @@ def main():
         # ---------- 5. wav 格式 ----------
         seq = (state.get("replies") or [{}])[-1].get("seq")
         if seq:
-            r = requests.get(base + "/audio?seq=%d" % seq, timeout=10)
+            r = SESSION.get(base + "/audio?seq=%d" % seq, timeout=10)
             ok = r.status_code == 200 and r.content[:4] == b"RIFF"
             detail = "status=%d len=%d head=%r" % (r.status_code, len(r.content), r.content[:4])
             if ok:
@@ -165,26 +170,26 @@ def main():
             check("GET /audio 返回合法 WAV", False, "回复队列里没有 seq")
 
         # ---------- 6. 错误输入 ----------
-        r = requests.post(base + "/api/danmaku", data=b"{not json",
+        r = SESSION.post(base + "/api/danmaku", data=b"{not json",
                           headers={"Content-Type": "application/json"}, timeout=10)
         check("非法 JSON -> 400", r.status_code == 400, "status=%d" % r.status_code)
 
-        r = requests.post(base + "/api/danmaku", json={"foo": "bar"}, timeout=10)
+        r = SESSION.post(base + "/api/danmaku", json={"foo": "bar"}, timeout=10)
         check("缺少 content/text -> 400", r.status_code == 400, "status=%d" % r.status_code)
 
-        r = requests.post(base + "/api/danmaku", json=["a", "b"], timeout=10)
+        r = SESSION.post(base + "/api/danmaku", json=["a", "b"], timeout=10)
         check("JSON 数组 -> 400", r.status_code == 400, "status=%d" % r.status_code)
 
-        r = requests.post(base + "/api/danmaku", data=b"x" * 9000,
+        r = SESSION.post(base + "/api/danmaku", data=b"x" * 9000,
                           headers={"Content-Type": "application/json"}, timeout=10)
         check("超大请求体 -> 413", r.status_code == 413, "status=%d" % r.status_code)
 
         # ---------- 7. 访问控制 ----------
-        r = requests.get(base + "/api/state", timeout=10,
+        r = SESSION.get(base + "/api/state", timeout=10,
                          headers={"Host": "evil.example.com"})
         check("伪造 Host -> 403", r.status_code == 403, "status=%d" % r.status_code)
 
-        r = requests.post(base + "/api/danmaku", json={"text": "x"}, timeout=10,
+        r = SESSION.post(base + "/api/danmaku", json={"text": "x"}, timeout=10,
                           headers={"Origin": "http://evil.example.com"})
         check("跨站 Origin -> 403", r.status_code == 403, "status=%d" % r.status_code)
 
@@ -200,7 +205,7 @@ def main():
         check("编码型路径穿越被拒绝", b"403" in head or b"404" in head, head.decode("latin1"))
 
         # ---------- 9. 未知路径 ----------
-        r = requests.get(base + "/no-such-endpoint", timeout=10)
+        r = SESSION.get(base + "/no-such-endpoint", timeout=10)
         check("未知路径 -> 404", r.status_code == 404, "status=%d" % r.status_code)
 
     finally:
@@ -209,6 +214,107 @@ def main():
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+    # ---------- 10. 暴露面门禁：绑 0.0.0.0 但无令牌必须拒绝启动 ----------
+    env_open = dict(env)
+    env_open.update({"BRIDGE_HOST": "0.0.0.0", "BRIDGE_TOKEN": ""})
+    env_open.pop("BRIDGE_ALLOW_UNAUTHENTICATED", None)
+    p2 = subprocess.run([sys.executable, BRIDGE], cwd=ROOT, env=env_open,
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=60)
+    out2 = (p2.stdout or "") + (p2.stderr or "")
+    check("0.0.0.0 无令牌时拒绝启动", p2.returncode != 0,
+          "returncode=%s" % p2.returncode)
+    check("拒绝启动时给出可操作提示", "BRIDGE_TOKEN" in out2, out2.strip()[:200])
+
+    # ---------- 11. 令牌过短必须拒绝启动 ----------
+    env_short = dict(env)
+    env_short.update({"BRIDGE_HOST": "0.0.0.0", "BRIDGE_TOKEN": "short"})
+    env_short.pop("BRIDGE_ALLOW_UNAUTHENTICATED", None)
+    p_short = subprocess.run([sys.executable, BRIDGE], cwd=ROOT, env=env_short,
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=60)
+    out_short = (p_short.stdout or "") + (p_short.stderr or "")
+    check("令牌过短时拒绝启动", p_short.returncode != 0,
+          "returncode=%s" % p_short.returncode)
+    check("令牌过短提示含位数要求", "16" in out_short, out_short.strip()[:200])
+
+    # ---------- 11b. 非 ASCII 令牌必须拒绝启动 ----------
+    # http.server 用 latin-1 解请求头、parse_qs 用 UTF-8 解 query，非 ASCII 令牌
+    # 会在两条路径上得到不同字节，表现为「URL 能用、请求头 401」。直接禁掉。
+    env_cjk = dict(env)
+    env_cjk.update({"BRIDGE_HOST": "0.0.0.0", "BRIDGE_TOKEN": "这是一个中文令牌共十八个字符用于测试"})
+    env_cjk.pop("BRIDGE_ALLOW_UNAUTHENTICATED", None)
+    p_cjk = subprocess.run([sys.executable, BRIDGE], cwd=ROOT, env=env_cjk,
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60)
+    out_cjk = (p_cjk.stdout or "") + (p_cjk.stderr or "")
+    check("非 ASCII 令牌拒绝启动", p_cjk.returncode != 0,
+          "returncode=%s" % p_cjk.returncode)
+    check("非 ASCII 令牌提示含生成命令", "token_urlsafe" in out_cjk,
+          out_cjk.strip()[:200])
+
+    # ---------- 12. 局域网模式：写必须被禁、读必须验令牌 ----------
+    try:
+        lan_ip = socket.gethostbyname_ex(socket.gethostname())[2][0]
+    except Exception:
+        lan_ip = None
+
+    if not lan_ip:
+        check("局域网模式验证", False, "无法获取本机 IP，跳过")
+    else:
+        port3 = port + 2
+        token = "smoke-token-1234567890"
+        env_lan = dict(env)
+        env_lan.update({"BRIDGE_HOST": "0.0.0.0", "BRIDGE_PORT": str(port3),
+                        "BRIDGE_TOKEN": token})
+        p3 = subprocess.Popen([sys.executable, BRIDGE], cwd=ROOT, env=env_lan,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            if not wait_port(port3):
+                check("局域网模式实例启动", False, "端口未监听")
+            else:
+                base3 = "http://%s:%d" % (lan_ip, port3)
+
+                r = SESSION.get(base3 + "/api/state", timeout=10)
+                check("远程读未带令牌 -> 401", r.status_code == 401,
+                      "status=%d" % r.status_code)
+
+                r = SESSION.get(base3 + "/api/state", timeout=10,
+                                headers={"X-Bridge-Token": token})
+                check("远程读带对令牌 -> 200", r.status_code == 200,
+                      "status=%d" % r.status_code)
+
+                r = SESSION.get(base3 + "/api/state", timeout=10,
+                                headers={"X-Bridge-Token": "wrong-token-xxxxxx"})
+                check("远程读带错令牌 -> 401", r.status_code == 401,
+                      "status=%d" % r.status_code)
+
+                # 核心：写入口只认回环，带对令牌也不能远程写
+                r = SESSION.post(base3 + "/api/danmaku", json={"text": "远程写入"},
+                                 headers={"X-Bridge-Token": token}, timeout=10)
+                check("远程写即使带对令牌也 -> 403", r.status_code == 403,
+                      "status=%d body=%s" % (r.status_code, r.text[:120]))
+
+                r = SESSION.get(base3 + "/?token=" + token, timeout=10)
+                check("页面可用 ?token= 打开",
+                      r.status_code == 200 and "Live2D" in r.text,
+                      "status=%d len=%d" % (r.status_code, len(r.text)))
+                check("页面响应头带 Referrer-Policy",
+                      r.headers.get("Referrer-Policy") == "no-referrer",
+                      repr(r.headers.get("Referrer-Policy")))
+                check("页面不再内嵌令牌",
+                      token not in r.text, "响应正文中出现了令牌明文")
+
+                r = SESSION.get(base3 + "/", timeout=10)
+                check("页面不带令牌 -> 401", r.status_code == 401,
+                      "status=%d" % r.status_code)
+        finally:
+            p3.terminate()
+            try:
+                p3.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p3.kill()
 
     failed = [r for r in RESULTS if not r[1]]
     print("\n" + "-" * 56)

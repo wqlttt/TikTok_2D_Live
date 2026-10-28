@@ -17,6 +17,7 @@
 依赖：verify_pipeline.py 同目录；requests + python-dotenv（usually 环境已装）。
 """
 
+import hmac
 import json
 import os
 import re
@@ -26,7 +27,7 @@ import time
 import traceback
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 # 跨平台 TTS：piper / macOS say / Windows sapi，按 TTS_BACKEND 或平台自动选择
 from tts_backend import (
@@ -54,18 +55,33 @@ PORT = int(env("BRIDGE_PORT", "8000") or 8000)
 MIN_INTERVAL = float(env("BRIDGE_MIN_INTERVAL", "3") or 3)   # 两条回复最小间隔(秒)
 MAX_QUEUE = int(env("BRIDGE_MAX_QUEUE", "20") or 20)
 MAX_BODY = int(env("BRIDGE_MAX_BODY", "8192") or 8192)       # 请求体上限(字节)
-BRIDGE_TOKEN = env("BRIDGE_TOKEN", "")   # 可选；设了才校验 X-Bridge-Token
 
-# Host / Origin 白名单：只接受本机访问，阻断 DNS rebinding 与跨站请求。
-# 攻击者可以让受害者浏览器去请求 http://evil.example:8000/（解析到 127.0.0.1），
-# 借同源策略之外的路径打本地服务，进而触发 DeepSeek 计费调用。
-ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
-if HOST not in ("", "0.0.0.0", "::"):
+# BRIDGE_TOKEN 是「只读视图令牌」：只保护 GET（页面 / 状态 / 音频 / 视频）。
+# 写入口 /api/danmaku 只允许回环访问，因此令牌永远不会成为可写凭据——
+# 即使它随 ?token= 出现在 URL 里、被分享出去，最坏后果也只是「别人看到你的
+# 弹幕」，而不是「别人替你烧 API 额度」。
+BRIDGE_TOKEN = env("BRIDGE_TOKEN", "")
+TOKEN_B = BRIDGE_TOKEN.encode("utf-8") if BRIDGE_TOKEN else b""
+MIN_TOKEN_LEN = 16
+ALLOW_UNAUTHENTICATED = env("BRIDGE_ALLOW_UNAUTHENTICATED", "").lower() in (
+    "1", "true", "yes", "on")
+
+# ---- 绑定与访问控制 ----
+# 注意：Host 白名单只防 DNS rebinding（攻击者域名解析到 127.0.0.1 后借浏览器
+# 打本地服务），**它不构成鉴权**——Host 头是客户端自填的，攻击者直接写
+# `Host: 127.0.0.1:8000` 就能过。真正的屏障是「写只允许回环」。
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+BOUND_TO_LOOPBACK = HOST in LOOPBACK_HOSTS or HOST == ""
+ALLOWED_HOSTS = set(LOOPBACK_HOSTS)
+if HOST and HOST not in ("0.0.0.0", "::"):
     ALLOWED_HOSTS.add(HOST)
-try:
-    LOCAL_IPS = set(socket.gethostbyname_ex(socket.gethostname())[2])
-except Exception:  # 离线或网络异常时不阻断启动
-    LOCAL_IPS = set()
+# 只有显式暴露到局域网时才接受本机网卡 IP，避免「已防护」的错觉
+LOCAL_IPS = set()
+if not BOUND_TO_LOOPBACK:
+    try:
+        LOCAL_IPS = set(socket.gethostbyname_ex(socket.gethostname())[2])
+    except Exception:  # 离线或网络异常时不阻断启动
+        LOCAL_IPS = set()
 
 LOCK = threading.Lock()
 QUEUE = deque()
@@ -203,7 +219,13 @@ def finish_reply(reply, voice_label, user, content, timings, say_voice=None):
     t0 = time.time()
     # 后端选择统一由 tts_backend 负责（piper / say / sapi），这里不再分支，
     # 否则新增后端时容易漏改某条分支而落到 macOS 专属的 say 上。
-    wav_path = tts_synthesize(text, say_voice or None)
+    #
+    # vidu 模式例外：进场播报、礼物感谢、换角色提示这类短句直接走 finish_reply，
+    # 不经过 process_one 的 vidu 分支；而 tts_backend 里没有实现 vidu（云端
+    # 对口型在 process_one 里单独处理）。沿用改造前的行为：vidu 模式下短播报
+    # 用平台原生 TTS 兜底，否则这些播报会全部报错。
+    backend = resolve_backend("auto") if TTS_BACKEND == "vidu" else TTS_BACKEND
+    wav_path = tts_synthesize(text, say_voice or None, backend=backend)
     timings["tts"] = round(time.time() - t0, 2)
     with LOCK:
         LATEST_AUDIO = wav_path
@@ -416,6 +438,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        # 页面 URL 可能带 ?token=，必须阻止它随 Referer 泄漏到任何外部资源。
+        # 用响应头而不是 <meta name="referrer">：meta 只对其后发起的请求生效，
+        # 有人把远程资源挪到 meta 之前就会静默失效；响应头覆盖所有响应且改不掉。
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(data)
 
@@ -433,16 +459,53 @@ class Handler(BaseHTTPRequestHandler):
             host = raw.rsplit(":", 1)[0]
         return host.strip().lower() in ALLOWED_HOSTS or host.strip() in LOCAL_IPS
 
+    def _is_loopback_client(self):
+        """请求是否来自本机（本机转发器与浏览器无需携带令牌）。"""
+        ip = (self.client_address[0] if self.client_address else "") or ""
+        return (ip.startswith("127.") or ip in ("::1", "0:0:0:0:0:0:0:1")
+                or ip == "::ffff:127.0.0.1")
+
+    def _token_ok(self, allow_query=False):
+        """只读视图令牌校验。
+
+        回环客户端免校验（本机转发器与 OBS 浏览器源照常工作）；非回环客户端
+        必须带对令牌。只有页面入口（GET /）允许用 ?token= 传令牌——那是用户
+        手输的入口，浏览器无法在地址栏带自定义头。
+        """
+        if not BRIDGE_TOKEN:
+            return True          # 仅在回环绑定或显式 ALLOW_UNAUTHENTICATED 下出现
+        if self._is_loopback_client():
+            return True
+        got = self.headers.get("X-Bridge-Token") or ""
+        if not got and allow_query:
+            try:
+                got = (parse_qs(urlsplit(self.path).query).get("token") or [""])[0]
+            except ValueError:
+                got = ""
+        if not got:
+            return False
+        return hmac.compare_digest(got.encode("utf-8"), TOKEN_B)
+
     def _origin_ok(self):
         """校验 Origin（阻断跨站 POST）。非浏览器客户端不带 Origin，放行。"""
         origin = (self.headers.get("Origin") or "").strip()
         if not origin:
             return True
         try:
-            host = (urlsplit(origin).hostname or "").lower()
+            parts = urlsplit(origin)
         except ValueError:
             return False
-        return host in ALLOWED_HOSTS or host in LOCAL_IPS
+        host = (parts.hostname or "").lower()
+        if host not in ALLOWED_HOSTS and host not in LOCAL_IPS:
+            return False
+        # 端口也要比：否则任意本地端口的页面都能对本服务发起跨站请求
+        try:
+            port = parts.port
+        except ValueError:
+            return False
+        if port is None:
+            return PORT in (80, 443)
+        return port == PORT
 
     def _deny(self):
         return self._send(403, {"error": "forbidden: host/origin not allowed"})
@@ -450,9 +513,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._host_ok():
             return self._deny()
-        if self.path in ("/", "/avatar"):
+        # 先剥掉 query 再匹配路径：否则带 ?token= 的入口会被后面所有分支漏掉
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/avatar"):
+            if not self._token_ok(allow_query=True):
+                return self._send(401, {"error": "bad token"})
             return self._send(200, AVATAR_HTML, "text/html; charset=utf-8")
-        if self.path == "/api/state":
+        if path == "/api/state":
+            if not self._token_ok():
+                return self._send(401, {"error": "bad token"})
             with LOCK:
                 d = dict(LATEST)
                 d["replies"] = list(REPLIES)
@@ -463,6 +532,8 @@ class Handler(BaseHTTPRequestHandler):
                 d["gift_log"] = list(GIFT_LOG)
                 return self._send(200, d)
         if self.path.startswith("/audio"):
+            if not self._token_ok():
+                return self._send(401, {"error": "bad token"})
             p = None
             if "seq=" in self.path:
                 try:
@@ -478,6 +549,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, f.read(), "audio/wav")
             return self._send(404, {"error": "no audio yet"})
         if self.path.startswith("/video"):
+            if not self._token_ok():
+                return self._send(401, {"error": "bad token"})
             with LOCK:
                 p = LATEST.get("local_path", "")
             if p and os.path.exists(p):
@@ -507,9 +580,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self._host_ok() or not self._origin_ok():
             return self._deny()
         if self.path == "/api/danmaku":
-            if BRIDGE_TOKEN:
-                if (self.headers.get("X-Bridge-Token") or "") != BRIDGE_TOKEN:
-                    return self._send(401, {"error": "bad token"})
+            # 写入口只允许本机：转发器 cyber-xiaoya-danmaku 永远连
+            # http://127.0.0.1:8000，远程写没有真实需求。
+            # 返回 403 而不是 401 —— 避免转发器把「远程写被禁」误判成令牌过期
+            # 去反复重试；同时明确区分「没权限做这件事」与「令牌不对」。
+            if not self._is_loopback_client():
+                return self._send(403, {"error": "remote write disabled"})
             try:
                 n = int(self.headers.get("Content-Length", 0) or 0)
                 if n <= 0:
@@ -553,8 +629,46 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def check_auth_config():
+    """启动前的鉴权配置检查（失败关闭）。
+
+    默认配置（127.0.0.1）不受影响。一旦绑到非回环地址，必须提供足够长的
+    只读令牌，否则拒绝启动——避免用户在不知情的情况下把弹幕流与音频暴露给
+    整个局域网。
+
+    即使配了令牌，也要注意：令牌只保护读，写入口已经硬性限定回环。
+    """
+    if BOUND_TO_LOOPBACK:
+        return
+    if ALLOW_UNAUTHENTICATED:
+        print("[安全警告] BRIDGE_HOST=%s 已暴露到局域网，且未设置只读令牌。" % HOST)
+        print("           同网段任何人都能查看弹幕与音频（写入口仍只允许本机）。")
+        return
+    if not BRIDGE_TOKEN:
+        raise SystemExit(
+            "[配置错误] BRIDGE_HOST=%s 会把服务暴露到局域网，但 BRIDGE_TOKEN 为空。\n"
+            "  请二选一：\n"
+            "    1) 设置 BRIDGE_TOKEN=<至少 16 位的随机串>，用 ?token= 打开页面\n"
+            "    2) 设 BRIDGE_ALLOW_UNAUTHENTICATED=1 明确接受只读暴露\n"
+            "  注：写入口 /api/danmaku 无论如何都只允许本机访问，\n"
+            "  所以远程无法替你消耗 API 额度。" % HOST)
+    if len(BRIDGE_TOKEN) < MIN_TOKEN_LEN:
+        raise SystemExit(
+            "[配置错误] BRIDGE_TOKEN 太短（%d 位），暴露到局域网时至少需要 %d 位。"
+            % (len(BRIDGE_TOKEN), MIN_TOKEN_LEN))
+    if not BRIDGE_TOKEN.isascii():
+        # http.server 用 latin-1 解码请求头，而 parse_qs 按 UTF-8 解码 query。
+        # 非 ASCII 令牌在这两条路径上会得到不同的字节序列，导致「URL 里能用、
+        # 请求头里 401」这种诡异现象。强制 ASCII 后两种编码等价，两条路径天然
+        # 一致——不要去分路径 encode，那会留下只在一条路径正确的分支。
+        raise SystemExit(
+            "[配置错误] BRIDGE_TOKEN 只能包含 ASCII 字符（建议用随机串）。\n"
+            "  生成：python -c \"import secrets;print(secrets.token_urlsafe(24))\"")
+
+
 if __name__ == "__main__":
     configure_console()   # Windows 下输出重定向时不因 GBK 编码崩溃
+    check_auth_config()
     tts_warmup(TTS_BACKEND)  # Piper 预热（阻塞几秒，避免与 worker 线程竞争加载模型）
     threading.Thread(target=worker, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)

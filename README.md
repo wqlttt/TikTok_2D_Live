@@ -239,7 +239,32 @@ bash setup_piper.sh   # 安装 piper-tts + 下载音色(小雅) + g2pw 模型(~2
 | `SAPI_TTS_MAX_CHARS` | 单条朗读文本上限（默认 800） |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | 桥监听地址/端口 |
 | `BRIDGE_MAX_BODY` | 请求体上限字节数（默认 8192） |
-| `BRIDGE_TOKEN` | 可选共享令牌；设了之后请求必须带 `X-Bridge-Token` 头 |
+| `BRIDGE_TOKEN` | **只读**视图令牌；绑非回环地址时必填且 ≥16 位 |
+| `BRIDGE_ALLOW_UNAUTHENTICATED` | 绑非回环地址且不设令牌时，显式接受「局域网可只读访问」 |
+
+### 局域网访问与安全边界
+
+默认只绑 `127.0.0.1`，本机以外无法访问。如果需要从手机/平板看虚拟人页面，把
+`BRIDGE_HOST` 改成 `0.0.0.0` 并设置 `BRIDGE_TOKEN`（至少 16 位、只能是 ASCII），
+然后用 `http://<本机IP>:8000/?token=<令牌>` 打开。
+
+令牌请用随机串生成，别手打——手打的短词长度够了但熵极低，16 位要求形同虚设：
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(24))"
+```
+
+边界说清楚，避免误判防护强度：
+
+- **写入口 `/api/danmaku` 只允许回环访问**，远程一律 403。因此无论令牌是否泄漏，
+  别人都无法替你消耗 DeepSeek 额度。
+- 令牌只保护**读**（页面 / 状态 / 音频 / 视频）。它随 URL 出现，可能进入浏览器
+  历史或转发出去——所以刻意不赋予它写权限，泄漏的最坏后果只是「别人看到你的弹幕」。
+- 页面响应带 `Referrer-Policy: no-referrer`，避免带 `?token=` 的 URL 通过 Referer
+  泄漏给外部资源。
+- **不支持反向代理**。Host 校验会拒绝 `evil.example.com` 这类域名，所以请勿把本服务
+  挂在 Nginx / Caddy 后面用域名访问，否则会 403。这层校验只防 DNS rebinding，
+  不是鉴权。
 
 ### 排查 TTS 问题
 
