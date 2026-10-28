@@ -155,6 +155,31 @@ def case_fail_closed(port):
             stop(p)
 
 
+def case_empty_host(port):
+    """BRIDGE_HOST 为空串时必须拒绝启动。
+
+    Python 里 `ThreadingHTTPServer(("", port))` 等于监听所有网卡（等价 0.0.0.0）。
+    一旦把空串当成回环，fail-closed 就被绕过——局域网带伪造 Host 头即可读到
+    /api/state 与音频。
+    """
+    p = boot(port, {"BRIDGE_HOST": "", "BRIDGE_TOKEN": ""})
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and p.poll() is None:
+            time.sleep(0.2)
+        exited = p.poll() is not None
+        out = p.stdout.read() if exited and p.stdout else ""
+        check("BRIDGE_HOST 空串 + 空令牌 -> 拒绝启动",
+              exited and p.returncode != 0,
+              "进程仍在运行（fail-open）rc=%s" % p.returncode)
+        if exited:
+            check("空 BRIDGE_HOST 的提示可操作",
+                  "BRIDGE_TOKEN" in out, (out or "")[:160])
+    finally:
+        if p.poll() is None:
+            stop(p)
+
+
 def case_origin_port(port):
     """Origin 端口必须比对。"""
     p = boot(port, {"BRIDGE_HOST": "127.0.0.1", "BRIDGE_TOKEN": ""})
@@ -422,6 +447,7 @@ def case_explicit_optin(port):
 def main():
     print("访问控制回归（%s）\n" % os.path.basename(BRIDGE))
     case_fail_closed(8181)
+    case_empty_host(8190)
     case_origin_port(8182)
     case_token_nonloopback(8183)
     case_page_no_token(8185)

@@ -45,6 +45,35 @@ def check(name, ok, detail=""):
     return ok
 
 
+def has_local_tts():
+    """探一下本机是否真有可用的本地 TTS。
+
+    CI 的精简镜像可能既没有 `say` 也没装中文音色，这种情况下跑冒烟只会得到
+    一堆与代码无关的失败，不如明确跳过。
+    """
+    sys.path.insert(0, ROOT)
+    try:
+        import tts_backend as tb
+        return bool(tb.list_voices(tb.resolve_backend()))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def lan_ip():
+    """取一个本机非回环 IPv4；没有则返回空串。
+
+    不能直接取 gethostbyname_ex(...)[2][0]：macOS 上这个值常是 127.0.0.1，
+    拿它去测「远程客户端」实际上还是本机请求，鉴权用例会变成假绿。
+    """
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+    return ""
+
+
 def wait_port(port, timeout=20.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -81,6 +110,10 @@ def main():
     args = ap.parse_args()
     port = args.port
     base = "http://127.0.0.1:%d" % port
+
+    if not has_local_tts():
+        print("[SKIP] 本机没有可用的本地 TTS 音色，跳过冒烟测试")
+        return 0
 
     env = dict(os.environ)
     env.update({
@@ -255,13 +288,9 @@ def main():
           out_cjk.strip()[:200])
 
     # ---------- 12. 局域网模式：写必须被禁、读必须验令牌 ----------
-    try:
-        lan_ip = socket.gethostbyname_ex(socket.gethostname())[2][0]
-    except Exception:
-        lan_ip = None
-
-    if not lan_ip:
-        check("局域网模式验证", False, "无法获取本机 IP，跳过")
+    lan = lan_ip()
+    if not lan:
+        print("[SKIP] 局域网用例：未找到非回环 IPv4（容器环境常见），跳过")
     else:
         port3 = port + 2
         token = "smoke-token-1234567890"
@@ -274,7 +303,7 @@ def main():
             if not wait_port(port3):
                 check("局域网模式实例启动", False, "端口未监听")
             else:
-                base3 = "http://%s:%d" % (lan_ip, port3)
+                base3 = "http://%s:%d" % (lan, port3)
 
                 r = SESSION.get(base3 + "/api/state", timeout=10)
                 check("远程读未带令牌 -> 401", r.status_code == 401,

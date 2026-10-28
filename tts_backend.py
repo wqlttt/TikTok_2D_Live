@@ -149,6 +149,19 @@ def resolve_backend(raw=None):
     return name
 
 
+def native_backend():
+    """平台原生后端（macOS say / Windows sapi），不考虑 Piper。
+
+    Piper 在运行期失败时用它兜底：模型加载失败、显存不足这类问题不该让
+    直播直接哑掉，退回系统音色继续说话更符合直播场景。
+    """
+    if IS_MAC:
+        return "say"
+    if IS_WIN:
+        return "sapi"
+    raise RuntimeError("当前平台没有原生 TTS 后端（仅 macOS / Windows 提供）")
+
+
 # ---------------------------------------------------------------- 音色
 
 
@@ -361,18 +374,25 @@ def synthesize(text, voice=None, backend=None):
 
 
 def warmup(backend=None):
-    """预热 Piper（加载模型 + 跑一次空合成）。
+    """预热 Piper，返回实际生效的后端名。
 
-    SAPI 每次调用都是独立进程，预热无意义，故不做。
+    显式 `TTS_BACKEND=piper` 时预热失败会抛出——用户明确选了 Piper，静默换音色
+    会让人以为配错了。auto 模式下失败则打日志并回落到平台原生后端：直播场景
+    宁可换个音色继续说话，也不要拖到第一条回复才崩。
     """
     backend = backend or resolve_backend()
     if backend != "piper":
-        return
+        return backend
     try:
         voice = _load_piper()
         list(voice.synthesize("。"))
-    except Exception:
-        pass
+        return "piper"
+    except Exception as e:  # noqa: BLE001
+        explicit = env("TTS_BACKEND", "auto").strip().lower() == "piper"
+        if explicit:
+            raise
+        print(f"[TTS] Piper 预热失败，回落到平台原生后端：{e}")
+        return native_backend()
 
 
 # ---------------------------------------------------------------- CLI

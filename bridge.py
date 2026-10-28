@@ -4,8 +4,9 @@
 最小可运行的本地「数字人桥」服务（仅用标准库，conda `usually` 环境零新依赖）。
 
 功能：
-  POST /api/danmaku   收弹幕 -> 入队 -> 后台走链路(DeepSeek -> TTS -> Vidu 对口型)
-  GET  /api/state     查最新一条处理结果（含各阶段耗时）
+  POST /api/danmaku   收弹幕/礼物 -> 入队 -> 后台走链路(DeepSeek -> TTS -> Vidu 对口型)
+                      礼物额外先走 GiftDirector，立即产出 Live2D 动作/特效
+  GET  /api/state     查最新一条处理结果（含各阶段耗时、礼物动作）
   GET  /video         播放最新渲染视频文件
   GET  /              预览页（自动轮询并播放最新视频）
 
@@ -22,6 +23,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -33,6 +35,7 @@ from urllib.parse import parse_qs, urlsplit
 from tts_backend import (
     BASE_DIR,
     configure_console,
+    native_backend,
     pick_local_voice,
     resolve_backend,
     synthesize as tts_synthesize,
@@ -43,16 +46,18 @@ from tts_backend import (
 from verify_pipeline import (
     download,
     deepseek_reply,
+    deepseek_stream,
     env,
     pick_voice,
     vidu_lipsync_submit,
     vidu_lipsync_wait,
     vidu_tts,
 )
+from director import GiftDirector
 
 HOST = env("BRIDGE_HOST", "127.0.0.1")
 PORT = int(env("BRIDGE_PORT", "8000") or 8000)
-MIN_INTERVAL = float(env("BRIDGE_MIN_INTERVAL", "3") or 3)   # 两条回复最小间隔(秒)
+MIN_INTERVAL = float(env("BRIDGE_MIN_INTERVAL", "3") or 3)   # 两条回复最小间隔(秒)，在 worker 里控制
 MAX_QUEUE = int(env("BRIDGE_MAX_QUEUE", "20") or 20)
 MAX_BODY = int(env("BRIDGE_MAX_BODY", "8192") or 8192)       # 请求体上限(字节)
 
@@ -71,7 +76,10 @@ ALLOW_UNAUTHENTICATED = env("BRIDGE_ALLOW_UNAUTHENTICATED", "").lower() in (
 # 打本地服务），**它不构成鉴权**——Host 头是客户端自填的，攻击者直接写
 # `Host: 127.0.0.1:8000` 就能过。真正的屏障是「写只允许回环」。
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-BOUND_TO_LOOPBACK = HOST in LOOPBACK_HOSTS or HOST == ""
+# 空串绝不能当成回环：ThreadingHTTPServer 绑 "" 等于监听所有网卡（等价 0.0.0.0）。
+# 之前写成 `or HOST == ""` 会让 `BRIDGE_HOST=` 直接绕过 fail-closed，
+# 局域网带伪造 Host 就能读到 /api/state。
+BOUND_TO_LOOPBACK = HOST in LOOPBACK_HOSTS
 ALLOWED_HOSTS = set(LOOPBACK_HOSTS)
 if HOST and HOST not in ("0.0.0.0", "::"):
     ALLOWED_HOSTS.add(HOST)
@@ -82,6 +90,9 @@ if not BOUND_TO_LOOPBACK:
         LOCAL_IPS = set(socket.gethostbyname_ex(socket.gethostname())[2])
     except Exception:  # 离线或网络异常时不阻断启动
         LOCAL_IPS = set()
+CHAT_TTL = float(env("BRIDGE_CHAT_TTL", "30") or 30)         # 普通弹幕排队超过 N 秒就不回了
+GIFT_TTL = float(env("BRIDGE_GIFT_TTL", "120") or 120)       # 礼物感谢保留更久
+STREAM_REPLY = env("DEEPSEEK_STREAM", "1").lower() not in ("0", "false", "no", "off")
 
 LOCK = threading.Lock()
 QUEUE = deque()
@@ -92,13 +103,16 @@ LATEST = {
     "timings": {}, "error": "", "updated_at": time.strftime("%H:%M:%S"),
 }
 _last_run = 0.0
-_last_content = ""
 LATEST_AUDIO = ""          # 本地 TTS 产出的最新 wav 路径
+TTS_BACKEND_ERROR = ""
 try:
     # piper(本地) / say(macOS) / sapi(Windows) / vidu(云端对口型) / auto(按平台探测)
     TTS_BACKEND = resolve_backend()
 except (ValueError, RuntimeError) as _e:
-    raise SystemExit(f"[配置错误] TTS_BACKEND 解析失败：{_e}")
+    # 不能在 import 阶段就退出：CI 会在 ubuntu 上 import bridge 跑单测，
+    # 而 Linux 既没有 say 也没有 sapi。这里记下原因，等到启动或首次合成时报错。
+    TTS_BACKEND = "auto"
+    TTS_BACKEND_ERROR = str(_e)
 HISTORY = deque(maxlen=int(env("HISTORY_TURNS", "8") or 8))   # 记忆最近 N 轮对话，让回复能接上下文
 USER_MEMORY = {}           # 昵称 -> deque([(弹幕, 回复), ...]) 按人记忆，提升用户亲和性
 REPLIES = deque(maxlen=30) # 已完成的回复队列（供前端排队播放，避免下一条覆盖上一条）
@@ -108,7 +122,10 @@ STARTED_AT = time.time()   # 桥启动时间(epoch)
 LAST_DANMAKU_TIME = None   # 上次收到弹幕的时间戳(epoch)，用于前端"是否在线"提示
 MODELS = ["Hiyori", "Haru", "Mao", "Natori", "Ren", "Rice", "Mark", "Wanko"]
 CURRENT_MODEL = "Hiyori"   # 当前角色，弹幕可切换
-GIFT_LOG = deque(maxlen=10) # 最近礼物事件（前端特效）
+GIFT_LOG = deque(maxlen=10) # 最近礼物事件（前端礼物榜/调试）
+DIRECTOR = GiftDirector()  # 礼物规则导演：事件 -> ActionPlan
+ACTION_SEQ = 0             # 动作序号，前端据此只播放新动作
+ACTION_LOG = deque(maxlen=20)  # 最近动作，供前端补播/排查
 
 
 def _gift_board_path():
@@ -124,12 +141,41 @@ def _load_gift_board():
         return {}
 
 
+_GIFT_BOARD_DIRTY = False
+
+
 def _save_gift_board():
+    """原子写礼物榜：先写临时文件再 os.replace，写到一半崩溃也不会把榜单写坏。"""
+    global _GIFT_BOARD_DIRTY
+    with LOCK:
+        if not _GIFT_BOARD_DIRTY:
+            return
+        snapshot = dict(GIFT_BOARD)
+        _GIFT_BOARD_DIRTY = False
+    path = _gift_board_path()
+    tmp = path + ".tmp"
     try:
-        with open(_gift_board_path(), "w", encoding="utf-8") as f:
-            json.dump(GIFT_BOARD, f, ensure_ascii=False)
-    except Exception:
-        pass
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        with LOCK:
+            _GIFT_BOARD_DIRTY = True   # 下次再试
+        traceback.print_exc()
+
+
+def add_gift_value(user, value):
+    """累计礼物榜（只改内存并标脏，由 gift_board_saver 每隔几秒落盘一次）。"""
+    global _GIFT_BOARD_DIRTY
+    with LOCK:
+        GIFT_BOARD[user] = GIFT_BOARD.get(user, 0) + value
+        _GIFT_BOARD_DIRTY = True
+
+
+def gift_board_saver(interval=5.0):
+    while True:
+        time.sleep(interval)
+        _save_gift_board()
 
 
 GIFT_BOARD = _load_gift_board()   # 送礼榜单：从文件恢复，跨重启累计
@@ -150,6 +196,19 @@ def _cleanup_audio():
                     os.remove(p)
                 except Exception:
                     pass
+
+
+def publish_action(plan):
+    """给导演产出的 ActionPlan 编序号，并放进最近动作队列。"""
+    global ACTION_SEQ
+    if not plan:
+        return None
+    with LOCK:
+        ACTION_SEQ += 1
+        action = dict(plan)
+        action["seq"] = ACTION_SEQ
+        ACTION_LOG.append(action)
+    return action
 
 
 _EMOJI_RE = re.compile(
@@ -211,38 +270,164 @@ def try_switch_model(content):
     return None
 
 
+def local_tts(text, say_voice=None):
+    """本地 TTS：统一委派给 tts_backend（piper / macOS say / Windows sapi）。
+
+    两点与上游原实现等价：
+      - Piper 运行期失败时回落到平台原生音色，不让直播直接哑掉；
+      - vidu 模式下进场播报/礼物感谢/换角色提示这类短句仍走本地合成——
+        它们不经过 process_one 的 vidu 分支，而 tts_backend 没有实现 vidu
+        （云端对口型在 process_one 里单独处理），不兜底就会全部报错。
+    """
+    if TTS_BACKEND_ERROR:
+        raise RuntimeError(f"TTS 后端不可用：{TTS_BACKEND_ERROR}")
+    backend = resolve_backend("auto") if TTS_BACKEND == "vidu" else TTS_BACKEND
+    try:
+        return tts_synthesize(text, say_voice or None, backend=backend)
+    except Exception:  # noqa: BLE001
+        if backend != "piper":
+            raise
+        traceback.print_exc()
+        return tts_synthesize(text, say_voice or None, backend=native_backend())
+
+
+def _push_reply(entry, wav_path):
+    """把一条（或一段）已合成的回复放进前端播放队列。"""
+    global REPLY_SEQ, LATEST_AUDIO
+    with LOCK:
+        REPLY_SEQ += 1
+        entry["seq"] = REPLY_SEQ
+        REPLIES.append(entry)
+        if wav_path:
+            REPLY_AUDIO[REPLY_SEQ] = wav_path
+            LATEST_AUDIO = wav_path
+        _cleanup_audio()
+    return entry
+
+
+def _new_reply_id():
+    return f"r{int(time.time() * 1000)}"
+
+
 def finish_reply(reply, voice_label, user, content, timings, say_voice=None):
-    """合成语音 + 更新状态 + 入回复队列（chat/gift/speak 共用）。"""
-    global LATEST, LATEST_AUDIO, REPLY_SEQ
+    """合成整段语音 + 更新状态 + 入回复队列（换角色/直接念/非流式回复共用）。"""
     reply = filter_reply(reply)   # 本地敏感词兜底
     text = strip_emoji(reply)
     t0 = time.time()
-    # 后端选择统一由 tts_backend 负责（piper / say / sapi），这里不再分支，
-    # 否则新增后端时容易漏改某条分支而落到 macOS 专属的 say 上。
-    #
-    # vidu 模式例外：进场播报、礼物感谢、换角色提示这类短句直接走 finish_reply，
-    # 不经过 process_one 的 vidu 分支；而 tts_backend 里没有实现 vidu（云端
-    # 对口型在 process_one 里单独处理）。沿用改造前的行为：vidu 模式下短播报
-    # 用平台原生 TTS 兜底，否则这些播报会全部报错。
-    backend = resolve_backend("auto") if TTS_BACKEND == "vidu" else TTS_BACKEND
-    wav_path = tts_synthesize(text, say_voice or None, backend=backend)
+    wav_path = local_tts(text, say_voice) if text else ""
     timings["tts"] = round(time.time() - t0, 2)
     with LOCK:
-        LATEST_AUDIO = wav_path
         LATEST.update(status="done", reply=reply, voice=voice_label,
                       audio_url="", task_id="", video_url="",
                       local_path=wav_path, timings=timings,
                       error="", updated_at=time.strftime("%H:%M:%S"))
-    REPLY_SEQ += 1
-    REPLIES.append({"seq": REPLY_SEQ, "user": user, "content": content,
-                    "reply": reply, "voice": voice_label})
-    REPLY_AUDIO[REPLY_SEQ] = wav_path
-    _cleanup_audio()
+    _push_reply({"reply_id": _new_reply_id(), "part": 0, "final": True,
+                 "user": user, "content": content, "reply": reply, "voice": voice_label},
+                wav_path)
+
+
+# ---------------------------------------------------------------- 流式按句合成
+
+_STRONG_PUNCT = set("。！？!?；;…~～\n")
+_WEAK_PUNCT = set("，,、：:")
+_CLOSERS = set("」』”’）)】》 ")
+
+
+def _find_cut(buf, first):
+    """在 buf 里找切句位置；返回切点下标（不含），找不到返回 None。
+
+    只有标点后面已经出现了下一个正文字符才切——否则「哈哈！」之后紧跟的「！」
+    会被单独切成一段，念出来很怪。
+    """
+    n = len(buf)
+    i = 0
+    while i < n:
+        ch = buf[i]
+        strong = ch in _STRONG_PUNCT
+        # 第一句允许在逗号处提前切：尽快开口比断句完美更重要
+        weak_ok = ch in _WEAK_PUNCT and (first and i + 1 >= 8 or i + 1 >= 40)
+        if (strong and i + 1 >= 4) or weak_ok:
+            j = i + 1
+            while j < n and (buf[j] in _STRONG_PUNCT or buf[j] in _WEAK_PUNCT
+                             or buf[j] in _CLOSERS):
+                j += 1
+            if j < n:
+                return j
+            return None
+        i += 1
+    return None
+
+
+def iter_sentences(deltas):
+    """把流式文本增量切成适合 TTS 的句子（生成器）。"""
+    buf = ""
+    first = True
+    for delta in deltas:
+        buf += delta
+        while True:
+            cut = _find_cut(buf, first)
+            if cut is None:
+                break
+            seg, buf = buf[:cut], buf[cut:]
+            if seg.strip():
+                yield seg.strip()
+                first = False
+    if buf.strip():
+        yield buf.strip()
+
+
+def stream_reply(content, user, voice_label, say_voice, timings):
+    """DeepSeek 流式生成 + 逐句本地 TTS：第一句生成完就开口。返回完整回复文本。"""
+    t0 = time.time()
+    reply_id = _new_reply_id()
+    full = ""          # 气泡里显示的累计文本（含 emoji）
+    carry = ""         # 纯 emoji/标点的片段，并到下一句一起显示
+    part = 0
+    tts_total = 0.0
+    last_entry = None
+    deltas = deepseek_stream(content, nick=user, history=list(HISTORY),
+                             user_context=user_context(user))
+    for seg in iter_sentences(deltas):
+        seg = filter_reply(carry + seg)
+        carry = ""
+        speak_text = strip_emoji(seg).strip()
+        if not speak_text or all(c in _STRONG_PUNCT or c in _WEAK_PUNCT for c in speak_text):
+            carry = seg
+            continue
+        if part == 0:
+            timings["deepseek_first"] = round(time.time() - t0, 2)
+        full += seg
+        t1 = time.time()
+        wav_path = local_tts(speak_text, say_voice)
+        tts_total += time.time() - t1
+        if part == 0:
+            timings["first_audio"] = round(time.time() - t0, 2)
+        last_entry = _push_reply({"reply_id": reply_id, "part": part, "final": False,
+                                  "user": user, "content": content, "reply": full,
+                                  "say": speak_text, "voice": voice_label}, wav_path)
+        with LOCK:
+            LATEST.update(reply=full, voice=voice_label, local_path=wav_path)
+        part += 1
+    if carry:
+        full += carry
+    with LOCK:
+        if last_entry is not None:
+            # 前端每次轮询拿到的是 REPLIES 的新快照，改这里即可通知「这句话说完了」
+            last_entry["final"] = True
+            last_entry["reply"] = full
+    timings["deepseek"] = round(time.time() - t0, 2)
+    timings["tts"] = round(tts_total, 2)
+    if part == 0:   # 一句可念的都没有（空回复或只有 emoji）
+        raise RuntimeError("DeepSeek 返回了空回复")
+    with LOCK:
+        LATEST.update(status="done", reply=full, voice=voice_label,
+                      audio_url="", task_id="", video_url="", timings=timings,
+                      error="", updated_at=time.strftime("%H:%M:%S"))
+    return full
 
 
 def process_one(item):
     """在后台线程执行完整链路。item 含 kind: chat(弹幕)/gift(礼物)/speak(直接念)。"""
-    global LATEST, LATEST_AUDIO, REPLY_SEQ
     kind = item.get("kind", "chat")
     user = item.get("user", "")
     content = item.get("content") or item.get("text") or ""
@@ -250,16 +435,16 @@ def process_one(item):
         LATEST.update(status="processing", user=user, content=content,
                       reply="", voice="", video_url="", local_path="", error="",
                       updated_at=time.strftime("%H:%M:%S"))
-    timings = {}
-
-    # 换角色命令（仅 chat）
-    if kind == "chat":
-        new_model = try_switch_model(content)
-        if new_model:
-            finish_reply(f"好嘞，换到「{new_model}」啦～", "默认", user, content, timings)
-            return
+    timings = {"waited": round(time.time() - item.get("_ts", time.time()), 2)}
 
     try:
+        # 换角色命令（仅 chat）
+        if kind == "chat":
+            new_model = try_switch_model(content)
+            if new_model:
+                finish_reply(f"好嘞，换到「{new_model}」啦～", "默认", user, content, timings)
+                return
+
         # 直接念（进场/关注/点赞/守护/醒目留言等）
         if kind == "speak":
             finish_reply(item.get("text", ""), "默认", user, content, timings)
@@ -267,25 +452,29 @@ def process_one(item):
 
         # 礼物：累计榜单 + 记录最近礼物
         if kind == "gift":
-            GIFT_BOARD[user] = GIFT_BOARD.get(user, 0) + item.get("gift_value", 0)
-            GIFT_LOG.append({"nick": user, "item": item.get("gift_item"),
-                             "num": item.get("gift_num"), "value": item.get("gift_value")})
-            _save_gift_board()
-
-        # DeepSeek 回复（chat 和 gift 都走这里）
-        t0 = time.time()
-        reply = deepseek_reply(content, nick=user, history=list(HISTORY),
-                               user_context=user_context(user))
-        timings["deepseek"] = round(time.time() - t0, 2)
-        HISTORY.append({"role": "user", "content": f"弹幕：{content}"})
-        HISTORY.append({"role": "assistant", "content": reply})
-        if user:
-            USER_MEMORY.setdefault(user, deque(maxlen=3)).append((content, reply))
+            add_gift_value(user, item.get("gift_value", 0))
+            with LOCK:
+                GIFT_LOG.append({"nick": user, "item": item.get("gift_item"),
+                                 "num": item.get("gift_num"), "value": item.get("gift_value")})
 
         if TTS_BACKEND != "vidu":
             say_voice, voice_label = pick_local_voice(content)
-            finish_reply(reply, voice_label, user, content, timings, say_voice=say_voice)
+            if STREAM_REPLY:
+                reply = stream_reply(content, user, voice_label, say_voice, timings)
+            else:
+                t0 = time.time()
+                reply = deepseek_reply(content, nick=user, history=list(HISTORY),
+                                       user_context=user_context(user))
+                timings["deepseek"] = round(time.time() - t0, 2)
+                finish_reply(reply, voice_label, user, content, timings, say_voice=say_voice)
+            _remember(user, content, reply)
         else:
+            t0 = time.time()
+            reply = deepseek_reply(content, nick=user, history=list(HISTORY),
+                                   user_context=user_context(user))
+            timings["deepseek"] = round(time.time() - t0, 2)
+            _remember(user, content, reply)
+
             voice_id, voice_label = pick_voice(content)
             t0 = time.time()
             audio_url = vidu_tts(reply, voice_id)
@@ -312,77 +501,186 @@ def process_one(item):
                               audio_url=audio_url, task_id=task_id, video_url=video_url,
                               local_path=local_path, timings=timings,
                               error="", updated_at=time.strftime("%H:%M:%S"))
-            REPLY_SEQ += 1
-            REPLIES.append({"seq": REPLY_SEQ, "user": user, "content": content,
-                            "reply": reply, "voice": voice_label})
-    except Exception as e:  # noqa: BLE001
+            _push_reply({"reply_id": _new_reply_id(), "part": 0, "final": True,
+                         "user": user, "content": content, "reply": reply,
+                         "voice": voice_label}, "")
+    except BaseException as e:  # noqa: BLE001  require() 抛 SystemExit，也要接住，否则 worker 线程会死
         with LOCK:
-            LATEST.update(status="error", error=str(e), timings=timings,
+            LATEST.update(status="error", error=str(e) or type(e).__name__, timings=timings,
                           updated_at=time.strftime("%H:%M:%S"))
         traceback.print_exc()
+        if isinstance(e, KeyboardInterrupt):
+            raise
 
 
-def merge_adjacent_gifts(item):
-    """把队列里紧邻的同昵称礼物合并成一条，避免连击重复感谢。"""
+def _remember(user, content, reply):
+    HISTORY.append({"role": "user", "content": f"弹幕：{content}"})
+    HISTORY.append({"role": "assistant", "content": reply})
+    if user:
+        USER_MEMORY.setdefault(user, deque(maxlen=3)).append((content, reply))
+
+
+# ---------------------------------------------------------------- 队列调度
+#
+# 入口只负责入队（礼物永不因限流被丢），worker 负责节奏与挑选：
+#   - 优先级：礼物 > VIP > 提问/点名 > 普通弹幕/播报；同级先来先回
+#   - 过期：普通弹幕排队超过 CHAT_TTL 秒就丢——回复一分钟前的弹幕，观众早走了
+#   - 去重：event_id（抖音会重推）+ 短时间内相同弹幕文本（刷屏）
+#   - 队列满：新来的优先级不低于最差那条时，挤掉最差里最旧的；礼物永远能进
+
+PRIO_GIFT, PRIO_VIP, PRIO_QUESTION, PRIO_NORMAL = 0, 1, 2, 3
+_QUESTION_RE = re.compile(r"[?？]|吗|怎么|为什么|什么|小雅|主播|@")
+TEXT_DEDUPE_WINDOW = 10.0
+EVENT_DEDUPE_WINDOW = 120.0
+_SEEN_EVENTS = {}          # event_id -> 首次入队时间
+_RECENT_TEXT = {}          # 弹幕文本 -> 最近入队时间
+QUEUE_STATS = {"expired": 0, "evicted": 0, "deduped": 0, "rejected": 0}
+
+
+def _classify(item, now):
+    kind = item.get("kind")
+    vip = item.get("priority") == "vip"
+    if kind == "gift":
+        prio, ttl = PRIO_GIFT, GIFT_TTL
+    elif vip:
+        prio, ttl = PRIO_VIP, max(CHAT_TTL, 60.0)
+    elif kind == "chat" and _QUESTION_RE.search(item.get("content", "")):
+        prio, ttl = PRIO_QUESTION, CHAT_TTL
+    else:
+        prio, ttl = PRIO_NORMAL, CHAT_TTL
+    item["_prio"] = prio
+    item["_ts"] = now
+    item["_expires"] = now + ttl
+
+
+def _prune_seen(now):
+    for table, window in ((_SEEN_EVENTS, EVENT_DEDUPE_WINDOW), (_RECENT_TEXT, TEXT_DEDUPE_WINDOW)):
+        if len(table) > 500:
+            for k in [k for k, t in table.items() if now - t > window]:
+                del table[k]
+
+
+def _drop_expired(now):
+    expired = [i for i in QUEUE if i["_expires"] <= now]
+    for i in expired:
+        QUEUE.remove(i)
+    QUEUE_STATS["expired"] += len(expired)
+
+
+def enqueue(item, now=None):
+    """入队；返回是否真正入队。调用方无需关心节奏，限流在 worker 里做。"""
+    global LAST_DANMAKU_TIME
+    now = now if now is not None else time.time()
+    _classify(item, now)
+    eid = str(item.get("event_id") or "")
+    text = (item.get("content") or "").strip() if item.get("kind") == "chat" else ""
+    with LOCK:
+        LAST_DANMAKU_TIME = now
+        _prune_seen(now)
+        if eid:
+            seen = _SEEN_EVENTS.get(eid)
+            if seen is not None and now - seen < EVENT_DEDUPE_WINDOW:
+                QUEUE_STATS["deduped"] += 1
+                return False
+            _SEEN_EVENTS[eid] = now
+        if text:
+            seen = _RECENT_TEXT.get(text)
+            if seen is not None and now - seen < TEXT_DEDUPE_WINDOW:
+                QUEUE_STATS["deduped"] += 1
+                return False
+            _RECENT_TEXT[text] = now
+
+        _drop_expired(now)
+        if len(QUEUE) >= MAX_QUEUE:
+            worst = max(QUEUE, key=lambda i: (i["_prio"], -i["_ts"]))
+            if item["_prio"] == PRIO_GIFT and worst["_prio"] == PRIO_GIFT:
+                pass                       # 全是礼物：超额也收，礼物会在出队时合并
+            elif item["_prio"] <= worst["_prio"]:
+                QUEUE.remove(worst)
+                QUEUE_STATS["evicted"] += 1
+            else:
+                QUEUE_STATS["rejected"] += 1
+                return False
+        QUEUE.append(item)
+        if LATEST.get("status") not in ("processing",):
+            LATEST.update(status="queued", user=item.get("user", ""),
+                          content=item.get("content") or item.get("text") or "",
+                          updated_at=time.strftime("%H:%M:%S"))
+    return True
+
+
+def _merge_gifts_locked(item):
+    """把队列里同一观众的其它礼物合并进 item，避免连击时逐个感谢。调用方持有 LOCK。"""
     nick = item.get("user", "")
+    same = [g for g in QUEUE if g.get("kind") == "gift" and g.get("user") == nick]
+    if not same:
+        return item
+    counts = {item.get("gift_item", "礼物"): item.get("gift_num", 1)}   # 同名礼物合计
     total_num = item.get("gift_num", 1)
     total_value = item.get("gift_value", 0)
-    parts = [(item.get("gift_item", "礼物"), item.get("gift_num", 1))]
-    with LOCK:
-        while QUEUE and QUEUE[0].get("kind") == "gift" and QUEUE[0].get("user") == nick:
-            g = QUEUE.popleft()
-            total_num += g.get("gift_num", 1)
-            total_value += g.get("gift_value", 0)
-            parts.append((g.get("gift_item", "礼物"), g.get("gift_num", 1)))
-    if len(parts) > 1:
-        item["gift_num"] = total_num
-        item["gift_value"] = total_value
-        summary = "、".join(f"{n}个「{i}」" for i, n in parts)
-        item["content"] = f"观众「{nick}」连送了 {summary}"
+    for g in same:
+        QUEUE.remove(g)
+        name = g.get("gift_item", "礼物")
+        counts[name] = counts.get(name, 0) + g.get("gift_num", 1)
+        total_num += g.get("gift_num", 1)
+        total_value += g.get("gift_value", 0)
+    item["gift_num"] = total_num
+    item["gift_value"] = total_value
+    summary = "、".join(f"{n}个「{i}」" for i, n in counts.items())
+    item["content"] = f"观众「{nick or '神秘人'}」连送了 {summary}"
     return item
 
 
+def pick_next(now=None):
+    """挑下一条要处理的：先丢过期，再按 (优先级, 入队时间) 取最小。"""
+    now = now if now is not None else time.time()
+    with LOCK:
+        _drop_expired(now)
+        if not QUEUE:
+            return None
+        best = min(QUEUE, key=lambda i: (i["_prio"], i["_ts"]))
+        QUEUE.remove(best)
+        if best.get("kind") == "gift":
+            best = _merge_gifts_locked(best)
+        return best
+
+
+def _gift_waiting():
+    with LOCK:
+        return any(i.get("kind") == "gift" for i in QUEUE)
+
+
 def worker():
-    global _last_run, _last_content
+    global _last_run
     while True:
-        with LOCK:
-            item = QUEUE.popleft() if QUEUE else None
-        if item is None:
-            time.sleep(0.5)
+        # 节奏控制：两条回复之间至少隔 MIN_INTERVAL 秒（省 API 额度、给观众反应时间）。
+        # 礼物不等。等待期间新来的高优先级弹幕会在出队时被优先挑中。
+        wait = _last_run + MIN_INTERVAL - time.time()
+        if wait > 0 and not _gift_waiting():
+            time.sleep(min(wait, 0.2))
             continue
-        if item.get("kind") == "gift":
-            item = merge_adjacent_gifts(item)
+        item = pick_next()
+        if item is None:
+            time.sleep(0.2)
+            continue
         process_one(item)
         _last_run = time.time()
-        _last_content = item.get("content") or item.get("text") or ""
 
 
-def enqueue(item):
-    global _last_run, _last_content, LAST_DANMAKU_TIME
-    now = time.time()
-    if now - _last_run < MIN_INTERVAL:
-        with LOCK:
-            LATEST.update(status="done", reply="(限流) 回得太快啦，稍等～")
-        return False
-    key = item.get("content") or item.get("text") or ""
-    if key and key == _last_content:
-        return False
-    with LOCK:
-        if len(QUEUE) >= MAX_QUEUE:
-            return False
-        if item.get("priority") == "vip":
-            QUEUE.appendleft(item)   # 打赏过的观众弹幕插队
-        else:
-            QUEUE.append(item)
-        LAST_DANMAKU_TIME = now
-        LATEST.update(status="queued", user=item.get("user", ""), content=key,
-                      updated_at=time.strftime("%H:%M:%S"))
-    return True
+def director_tick_loop():
+    """后台推进礼物队列：当前演出结束后自动播下一个。"""
+    while True:
+        try:
+            publish_action(DIRECTOR.tick())
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        time.sleep(0.2)
 
 
 with open(os.path.join(BASE_DIR, "avatar.html"), encoding="utf-8") as _f:
     AVATAR_HTML = _f.read()
 LIVE2D_DIR = os.path.join(BASE_DIR, "live2d")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 
 PREVIEW_HTML = """<!doctype html>
@@ -522,6 +820,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             if not self._token_ok():
                 return self._send(401, {"error": "bad token"})
+            # ?since=<action_seq>：只返回该序号之后的动作，前端高频轮询时减小负载。
+            # 不传则返回全部最近动作（兼容旧调用方）。
+            since = 0
+            m = re.search(r"[?&]since=(\d+)", self.path)
+            if m:
+                since = int(m.group(1))
             with LOCK:
                 d = dict(LATEST)
                 d["replies"] = list(REPLIES)
@@ -530,6 +834,10 @@ class Handler(BaseHTTPRequestHandler):
                 d["model"] = CURRENT_MODEL
                 d["gift_board"] = sorted(GIFT_BOARD.items(), key=lambda x: -x[1])[:10]
                 d["gift_log"] = list(GIFT_LOG)
+                d["queue"] = {"depth": len(QUEUE), **QUEUE_STATS}
+                d["actions"] = [a for a in ACTION_LOG if a.get("seq", 0) > since]
+                d["action_seq"] = ACTION_SEQ
+                d["director"] = DIRECTOR.snapshot()
                 return self._send(200, d)
         if self.path.startswith("/audio"):
             if not self._token_ok():
@@ -557,6 +865,32 @@ class Handler(BaseHTTPRequestHandler):
                 with open(p, "rb") as f:
                     return self._send(200, f.read(), "video/mp4")
             return self._send(404, {"error": "no video yet"})
+        # 静态资源：礼物播放器、特效库、预渲染视频。
+        # 只允许 static/ 下的真实文件，防止 ../ 路径穿越。
+        if self.path.startswith("/static/"):
+            rel = self.path[len("/static/"):].split("?")[0]
+            full = os.path.realpath(os.path.join(STATIC_DIR, rel))
+            root = os.path.realpath(STATIC_DIR)
+            if not full.startswith(root + os.sep):
+                return self._send(403, {"error": "forbidden"})
+            if os.path.isfile(full):
+                if full.endswith(".js"):
+                    ct = "application/javascript; charset=utf-8"
+                elif full.endswith(".css"):
+                    ct = "text/css; charset=utf-8"
+                elif full.endswith(".json"):
+                    ct = "application/json; charset=utf-8"
+                elif full.endswith(".png"):
+                    ct = "image/png"
+                elif full.endswith(".webm"):
+                    ct = "video/webm"
+                elif full.endswith(".mp4"):
+                    ct = "video/mp4"
+                else:
+                    ct = "application/octet-stream"
+                with open(full, "rb") as f:
+                    return self._send(200, f.read(), ct)
+            return self._send(404, {"error": "not found"})
         if self.path.startswith("/live2d/"):
             rel = self.path[len("/live2d/"):].split("?")[0]
             full = os.path.realpath(os.path.join(LIVE2D_DIR, rel))
@@ -599,14 +933,38 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "json object required"})
             kind = (body.get("kind") or "").strip()
             priority = (body.get("priority") or "normal").strip()
+            action = None
             if kind == "gift":
                 nick = (body.get("nick") or body.get("say_nick") or "").strip()
-                num = int(body.get("gift_num") or 1)
                 itm = (body.get("gift_item") or "礼物").strip()
+                try:
+                    num = int(body.get("gift_num") or 1)
+                    gift_value = int(body.get("gift_value") or 0)
+                    combo = int(body.get("combo") or num)
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "gift_num/gift_value/combo must be numbers"})
+                num = max(1, num)
+                gift_value = max(0, gift_value)
+                combo = max(num, combo)
+                # 先走“快速演出”通道：不等 DeepSeek/TTS，礼物一到就能触发动作。
+                # 导演失败不能影响礼物入队/LLM 感谢链路，所以单独兜底。
+                try:
+                    action = publish_action(DIRECTOR.ingest({
+                        "nick": nick or "神秘人",
+                        "gift": itm,
+                        "count": num,
+                        "value": gift_value,
+                        "combo": combo,
+                        "gift_id": str(body.get("gift_id") or ""),
+                        "event_id": str(body.get("event_id") or ""),
+                    }))
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
                 item = {
                     "kind": "gift", "user": nick, "priority": priority,
                     "gift_item": itm, "gift_num": num,
-                    "gift_value": int(body.get("gift_value") or 0),
+                    "gift_value": gift_value,
+                    "event_id": str(body.get("event_id") or ""),
                     "content": f"观众「{nick or '神秘人'}」送了 {num} 个「{itm}」",
                 }
             elif (body.get("content") or "").strip():
@@ -614,15 +972,20 @@ class Handler(BaseHTTPRequestHandler):
                     "kind": "chat", "priority": priority,
                     "user": (body.get("user") or body.get("nick") or "").strip(),
                     "content": (body.get("content") or "").strip(),
+                    "event_id": str(body.get("event_id") or ""),
                 }
             elif (body.get("text") or "").strip():
                 item = {"kind": "speak", "user": "", "priority": priority,
-                        "text": (body.get("text") or "").strip()}
+                        "text": (body.get("text") or "").strip(),
+                        "event_id": str(body.get("event_id") or "")}
             else:
                 return self._send(400, {"error": "content required"})
             ok = enqueue(item)
-            return self._send(200, {"queued": ok, "depth": len(QUEUE),
-                                    "status": "queued" if ok else "skipped"})
+            response = {"queued": ok, "depth": len(QUEUE),
+                        "status": "queued" if ok else "skipped"}
+            if action:
+                response["action"] = action
+            return self._send(200, response)
         return self._send(404, {"error": "not found"})
 
     def log_message(self, *a):
@@ -669,8 +1032,22 @@ def check_auth_config():
 if __name__ == "__main__":
     configure_console()   # Windows 下输出重定向时不因 GBK 编码崩溃
     check_auth_config()
-    tts_warmup(TTS_BACKEND)  # Piper 预热（阻塞几秒，避免与 worker 线程竞争加载模型）
+    if TTS_BACKEND_ERROR:
+        # 支持平台上没有可用 TTS 就是配置错误，直接退出比跑起来再哑掉好。
+        # Linux 只用于 CI 跑接口/单测（既无 say 也无 sapi），放行但明确告警，
+        # 否则 CI 里所有需要启动服务的用例都会失败。
+        _msg = f"TTS 后端不可用：{TTS_BACKEND_ERROR}"
+        if os.name == "nt" or sys.platform == "darwin":
+            raise SystemExit(f"[配置错误] {_msg}")
+        print(f"[警告] {_msg}")
+        print("       当前平台无原生 TTS，服务仍会启动，但合成语音会失败；仅适合接口调试。")
+    # Piper 预热（阻塞几秒，避免与 worker 线程竞争加载模型）。
+    # auto 模式下预热失败会回落到平台原生后端，这里接住实际生效的后端，
+    # 免得拖到第一条回复才报错。
+    TTS_BACKEND = tts_warmup(TTS_BACKEND)
     threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=director_tick_loop, daemon=True).start()
+    threading.Thread(target=gift_board_saver, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"数字人桥已启动：http://{HOST}:{PORT}")
     print(f"  - 虚拟人页面： http://{HOST}:{PORT}/")
@@ -680,8 +1057,13 @@ if __name__ == "__main__":
     print(f"  TTS 后端 = {TTS_BACKEND}"
           f"（piper=本地模型 / say=macOS / sapi=Windows / vidu=云端对口型）")
     print(f"  工作目录 = {BASE_DIR}")
+    print(f"  - 礼物规则：   {DIRECTOR.snapshot().get('rules', 0)} 条（config/gift_actions.json）")
+    print(f"  回复模式 = {'流式按句合成' if STREAM_REPLY else '整段合成'}（DEEPSEEK_STREAM）"
+          f"；弹幕过期 {CHAT_TTL:g}s / 礼物过期 {GIFT_TTL:g}s")
     print("提示：开播前请确认 .env 已填 DeepSeek Key。")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止。")
+    finally:
+        _save_gift_board()   # 退出前把未落盘的礼物榜写掉

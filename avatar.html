@@ -20,13 +20,13 @@
   #speech{position:relative;flex:0 0 min(320px,26vw);
     padding:16px 22px;background:#fff;border-radius:20px;
     box-shadow:0 8px 28px rgba(0,0,0,.22);font-size:24px;font-weight:600;
-    color:#3a2b33;line-height:1.5;text-align:left;z-index:4;
+    color:#3a2b33;line-height:1.5;text-align:left;z-index:10;
     opacity:0;transition:opacity .35s;pointer-events:none;}
   #speech.show{opacity:1;}
   #speech::after{content:"";position:absolute;top:50%;left:-13px;
     transform:translateY(-50%);border:13px solid transparent;
     border-right-color:#fff;border-left:0;}
-  #danmaku-layer{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:5;}
+  #danmaku-layer{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:7;}
   .danmaku{position:absolute;left:100%;white-space:nowrap;font-size:20px;font-weight:600;
     color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.55),0 0 8px rgba(0,0,0,.3);
     animation:danmaku-move 9s linear forwards;}
@@ -47,13 +47,17 @@
   #gift-board .gb-row{display:flex;justify-content:space-between;gap:14px;line-height:1.55;}
   #gift-board .gb-nick{color:#ffd166;font-weight:600;}
 </style>
+<link rel="stylesheet" href="/static/gift-effects.css">
 </head>
 <body>
   <div id="wrap">
     <div id="stage">
     <canvas id="l2d"></canvas>
     <div id="l2d-status">正在加载模型…</div>
+    <canvas id="fx-canvas"></canvas>
     <div id="danmaku-layer"></div>
+    <div id="fx-layer"></div>
+    <div id="gift-toast"></div>
     </div>
     <div id="speech"></div>
   </div>
@@ -65,11 +69,17 @@
 <script src="/live2d/pixi.min.js"></script>
 <script src="/live2d/live2dcubismcore.min.js"></script>
 <script src="/live2d/cubism4.min.js"></script>
+<script src="/static/vendor/confetti.browser.js"></script>
+<script src="/static/gift-effects.js"></script>
+<script src="/static/gift-player.js"></script>
 <script>
 (function(){
   "use strict";
   var W = 800, H = 1040;           // 内部渲染分辨率（2x，更清晰）
   var app = null, model = null, coreModel = null, motionManager = null;
+  var giftPlayer = null;
+  var lastActionSeq = 0, actionInit = false;
+  var lastGiftBoardSig = "";
   var currentModelName = "Hiyori";
   var speechEl = document.getElementById("speech");
   var statusDot = document.querySelector("#status-badge .dot");
@@ -78,7 +88,7 @@
   var statusEl = document.getElementById("l2d-status");
 
   var currentOpen = 0, targetOpen = 0;
-  var speaking = false;
+  var speaking = false, wasSpeaking = false;
   var lastDanmaku = "";
   var audioCtx = null, analyser = null;
 
@@ -130,6 +140,14 @@
 
       coreModel = model.internalModel.coreModel;
       motionManager = model.internalModel.motionManager;
+      if (typeof GiftPlayer === "function") {
+        if (!giftPlayer) {
+          giftPlayer = new GiftPlayer({ model: model, stage: document.getElementById("stage"),
+                                        onFinish: function(){ pumpActions(); } });
+        } else {
+          giftPlayer.setModel(model, document.getElementById("stage"));
+        }
+      }
       // 自动 Idle 动作会驱动嘴部，和音频口型冲突，已通过 idleMotionGroup:"None" 关闭；
       // 眨眼/呼吸由内置组件自动处理。
       statusEl.style.display = "none";
@@ -159,6 +177,9 @@
   // 主循环：口型平滑 + 写入 Live2D 参数 + 肢体动作
   function applyGestures(now){
     if (!coreModel) return;
+    // 只有礼物时间轴里包含 motion 时，才把参数控制权交给 motion；
+    // 纯特效大礼物不锁待机手势。
+    if (giftPlayer && giftPlayer.isMotionActive()) return;
     var t = now / 1000;
     if (speaking) {
       // 说话时：轻微转头 + 双手轻摆（像在比划）
@@ -180,7 +201,11 @@
   function loop(now){
     currentOpen += (targetOpen - currentOpen) * 0.3;
     if (coreModel) {
-      coreModel.setParameterValueById("ParamMouthOpenY", currentOpen);
+      // 只在说话时驱动嘴；不说话时把嘴交还给 motion，避免动作里的口型被 0 覆盖。
+      if (speaking || wasSpeaking) {
+        coreModel.setParameterValueById("ParamMouthOpenY", speaking ? currentOpen : 0);
+      }
+      wasSpeaking = speaking;
       applyGestures(now || performance.now());
     }
     requestAnimationFrame(loop);
@@ -244,16 +269,37 @@
   var lastPlayedSeq = 0;
   var isPlaying = false;
   var queueInit = false;
+  // 流式回复会拆成多段（同一 reply_id，part 递增，最后一段 final=true）。
+  // 段与段之间可能有短暂空档，不能一播完就收气泡，否则会闪烁。
+  var lastItem = null, idleSince = 0;
+  var finalSeqs = {};
+  var HIDE_AFTER_FINAL_MS = 600, HIDE_AFTER_PARTIAL_MS = 6000;
+
+  function maybeHideSpeech(){
+    if (isPlaying || !speechEl.classList.contains("show") || !idleSince) return;
+    var done = !lastItem || lastItem.final !== false || finalSeqs[lastItem.seq];
+    var idle = Date.now() - idleSince;
+    if ((done && idle >= HIDE_AFTER_FINAL_MS) || idle >= HIDE_AFTER_PARTIAL_MS){
+      hideSpeech();
+      idleSince = 0;
+    }
+  }
 
   function enqueueReplies(replies){
-    if (!replies || replies.length === 0) return;
-    // 首次加载：跳到当前最新一条，不重播历史（避免刷新后卡住）
+    replies = replies || [];
+    // 首次加载：跳到当前最新一条，不重播历史（避免刷新后卡住）。
+    // 必须在「空列表」时也完成初始化——否则桥刚启动时第一条回复会被当成历史跳过。
     if (!queueInit){
       queueInit = true;
       for (var i = 0; i < replies.length; i++){
         if (replies[i].seq > lastPlayedSeq) lastPlayedSeq = replies[i].seq;
       }
       return;
+    }
+    if (replies.length === 0) return;
+    // 「最后一段」标记是服务端在生成结束后补上的，每次轮询都刷新一下
+    for (var k = 0; k < replies.length; k++){
+      if (replies[k].final) finalSeqs[replies[k].seq] = true;
     }
     for (var i = 0; i < replies.length; i++){
       var r = replies[i];
@@ -268,11 +314,15 @@
   function playNext(){
     if (playQueue.length === 0){
       isPlaying = false;
-      setTimeout(hideSpeech, 600);   // 队列空，语音播完后稍作停留再隐藏气泡
+      if (!idleSince) idleSince = Date.now();   // 每次轮询都会走到这里，不能重置计时
+      // 整句说完：稍作停留再收气泡；还有后续分段：等下一段，超时兜底
+      setTimeout(maybeHideSpeech, HIDE_AFTER_FINAL_MS);
       return;
     }
     isPlaying = true;
+    idleSince = 0;
     var item = playQueue.shift();
+    lastItem = item;
     showSpeech(item.reply);
     playAudio(item.seq).then(function(){ playNext(); });
   }
@@ -310,18 +360,33 @@
 
   function updateGiftBoard(board){
     var el = document.getElementById("gift-board");
+    var sig = JSON.stringify(board || []);
+    if (sig === lastGiftBoardSig) return;
+    lastGiftBoardSig = sig;
     if (!board || board.length === 0){
       el.style.display = "none";
       return;
     }
     el.style.display = "block";
-    var html = '<div class="gb-title">🎁 礼物榜</div>';
+    el.textContent = "";
+    var title = document.createElement("div");
+    title.className = "gb-title";
+    title.textContent = "🎁 礼物榜";
+    el.appendChild(title);
     for (var i = 0; i < Math.min(board.length, 5); i++){
       var nick = board[i][0] || "?";
       var val = board[i][1] || 0;
-      html += '<div class="gb-row"><span class="gb-nick">' + (i + 1) + '. ' + nick + '</span><span>' + val + ' 💎</span></div>';
+      var row = document.createElement("div");
+      row.className = "gb-row";
+      var nameEl = document.createElement("span");
+      nameEl.className = "gb-nick";
+      nameEl.textContent = (i + 1) + ". " + nick;
+      var valueEl = document.createElement("span");
+      valueEl.textContent = val + " 💎";
+      row.appendChild(nameEl);
+      row.appendChild(valueEl);
+      el.appendChild(row);
     }
-    el.innerHTML = html;
   }
 
   function updateStatus(s){
@@ -343,9 +408,25 @@
     statusText.textContent = text;
   }
 
+  // 前端动作队列：服务端按时长串行发布，但前端开播会比服务端晚一个轮询周期，
+  // 下一条到达时上一条可能还没播完——排队而不是直接 stop()，避免截掉尾巴。
+  var pendingActions = [];
+  var MAX_PENDING_ACTIONS = 5;
+  function playAction(act){
+    try {
+      giftPlayer.play(act);
+    } catch (err) {
+      console.warn("[avatar] gift action failed:", err);
+    }
+  }
+  function pumpActions(){
+    if (!giftPlayer || giftPlayer.isActive() || !pendingActions.length) return;
+    playAction(pendingActions.shift());
+  }
+
   async function poll(){
     try {
-      var r = await apiFetch("/api/state");
+      var r = await apiFetch("/api/state" + (actionInit ? "?since=" + lastActionSeq : ""));
       var s = await r.json();
       updateStatus(s);
       if (s.gift_board) updateGiftBoard(s.gift_board);
@@ -353,7 +434,33 @@
         currentModelName = s.model;
         loadModel(currentModelName);
       }
-      if (s.replies && s.replies.length) enqueueReplies(s.replies);
+      if (Array.isArray(s.replies)) enqueueReplies(s.replies);
+      maybeHideSpeech();
+      if (giftPlayer && Array.isArray(s.actions)) {
+        var serverSeq = Number(s.action_seq) || 0;
+        // bridge 重启后 action_seq 会归零；前端跟着重置，避免一直不播新动作。
+        if (serverSeq < lastActionSeq) lastActionSeq = 0;
+        if (!actionInit) {
+          actionInit = true;
+          lastActionSeq = serverSeq;
+        } else {
+          // 按 seq 顺序消费所有新动作：普通动作排队，带 interrupt 的立即打断。
+          // 不能只播最新一条——一次轮询窗口里可能有多条，旧的会被静默跳过。
+          var fresh = s.actions.filter(function(a){ return Number(a.seq) > lastActionSeq; })
+            .sort(function(a, b){ return Number(a.seq) - Number(b.seq); });
+          fresh.forEach(function(act){
+            lastActionSeq = Math.max(lastActionSeq, Number(act.seq) || 0);
+            if (act.interrupt) {
+              pendingActions = [];
+              playAction(act);
+            } else {
+              pendingActions.push(act);
+              if (pendingActions.length > MAX_PENDING_ACTIONS) pendingActions.shift();
+            }
+          });
+          pumpActions();
+        }
+      }
       if (s.content && s.content !== lastDanmaku){
         lastDanmaku = s.content;
         spawnDanmaku(s.user || "", s.content);
@@ -375,7 +482,7 @@
       if (audioCtx && audioCtx.state === "running") startHint.style.display = "none";
     } catch(e){}
   }, 800);
-  setInterval(poll, 1500);
+  setInterval(poll, 500);
   poll();
   init();
 })();

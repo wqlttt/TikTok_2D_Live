@@ -1,0 +1,78 @@
+/* 礼物演出特效层：与 avatar.html 解耦，后续换/加特效只改这里。 */
+#fx-canvas{
+  /* 大礼物特效覆盖整个 OBS 浏览器源，而不是只覆盖角色卡片 */
+  position:fixed;inset:0;width:100vw;height:100vh;
+  pointer-events:none;z-index:6;
+}
+#fx-layer{
+  position:absolute;inset:0;overflow:hidden;pointer-events:none;
+  z-index:8;border-radius:24px;
+}
+.fx-video{
+  position:fixed;inset:0;width:100vw;height:100vh;
+  object-fit:contain;pointer-events:none;z-index:8;
+}
+.fx-video-cover{object-fit:cover;}
+#gift-toast{
+  position:absolute;left:50%;top:12%;transform:translate(-50%,-8px) scale(.96);
+  max-width:82%;padding:10px 18px;border-radius:999px;
+  background:rgba(30,20,30,.84);color:#fff;
+  font-size:18px;font-weight:700;line-height:1.3;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  box-shadow:0 8px 26px rgba(0,0,0,.28);backdrop-filter:blur(6px);
+  opacity:0;pointer-events:none;z-index:9;
+  transition:opacity .18s ease,transform .18s ease;
+}
+#gift-toast.show{opacity:1;transform:translate(-50%,0) scale(1);}
+
+.fx-heart{
+  position:absolute;bottom:8%;font-size:26px;line-height:1;
+  animation:fx-float 2.2s ease-out forwards;
+  filter:drop-shadow(0 2px 6px rgba(255,70,120,.45));
+}
+@keyframes fx-float{
+  0%{opacity:0;transform:translateY(0) scale(.35)}
+  15%{opacity:1}
+  100%{opacity:0;transform:translateY(-72vh) scale(1.25)}
+}
+
+.fx-rose{
+  position:absolute;top:-8%;font-size:28px;line-height:1;
+  animation:fx-rose-fall 2.8s linear forwards;
+  filter:drop-shadow(0 2px 6px rgba(120,0,30,.35));
+}
+@keyframes fx-rose-fall{
+  0%{opacity:0;transform:translateY(0) rotate(0deg)}
+  10%{opacity:1}
+  100%{opacity:.9;transform:translateY(560px) rotate(300deg)}
+}
+
+.fx-confetti{
+  position:absolute;top:-20px;width:8px;height:14px;border-radius:2px;
+  animation:fx-confetti-fall 2.6s linear forwards;
+}
+@keyframes fx-confetti-fall{
+  0%{opacity:1;transform:translate3d(0,-20px,0) rotate(0deg)}
+  100%{opacity:.85;transform:translate3d(var(--dx,0px),560px,0) rotate(720deg)}
+}
+
+.fx-spark{
+  position:absolute;width:7px;height:7px;border-radius:50%;
+  top:50%;left:50%;
+  animation:fx-burst 1s ease-out forwards;
+}
+@keyframes fx-burst{
+  0%{opacity:1;transform:translate(0,0) scale(1)}
+  100%{opacity:0;transform:translate(var(--dx,0px),var(--dy,0px)) scale(.15)}
+}
+
+.fx-star{
+  position:absolute;font-size:18px;line-height:1;color:#fff3b0;
+  animation:fx-twinkle 1.6s ease-out forwards;
+  text-shadow:0 0 10px rgba(255,220,120,.9);
+}
+@keyframes fx-twinkle{
+  0%{opacity:0;transform:scale(.4) translateY(0)}
+  20%{opacity:1}
+  100%{opacity:0;transform:scale(1.2) translate(var(--dx,0px),var(--dy,-30px))}
+}
