@@ -18,15 +18,29 @@
 依赖：verify_pipeline.py 同目录；requests + python-dotenv（usually 环境已装）。
 """
 
+import hmac
 import json
 import os
 import re
-import subprocess
+import socket
+import sys
 import threading
 import time
 import traceback
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+# 跨平台 TTS：piper / macOS say / Windows sapi，按 TTS_BACKEND 或平台自动选择
+from tts_backend import (
+    BASE_DIR,
+    configure_console,
+    native_backend,
+    pick_local_voice,
+    resolve_backend,
+    synthesize as tts_synthesize,
+    warmup as tts_warmup,
+)
 
 # 复用验证脚本里的链路函数
 from verify_pipeline import (
@@ -45,6 +59,37 @@ HOST = env("BRIDGE_HOST", "127.0.0.1")
 PORT = int(env("BRIDGE_PORT", "8000") or 8000)
 MIN_INTERVAL = float(env("BRIDGE_MIN_INTERVAL", "3") or 3)   # 两条回复最小间隔(秒)，在 worker 里控制
 MAX_QUEUE = int(env("BRIDGE_MAX_QUEUE", "20") or 20)
+MAX_BODY = int(env("BRIDGE_MAX_BODY", "8192") or 8192)       # 请求体上限(字节)
+
+# BRIDGE_TOKEN 是「只读视图令牌」：只保护 GET（页面 / 状态 / 音频 / 视频）。
+# 写入口 /api/danmaku 只允许回环访问，因此令牌永远不会成为可写凭据——
+# 即使它随 ?token= 出现在 URL 里、被分享出去，最坏后果也只是「别人看到你的
+# 弹幕」，而不是「别人替你烧 API 额度」。
+BRIDGE_TOKEN = env("BRIDGE_TOKEN", "")
+TOKEN_B = BRIDGE_TOKEN.encode("utf-8") if BRIDGE_TOKEN else b""
+MIN_TOKEN_LEN = 16
+ALLOW_UNAUTHENTICATED = env("BRIDGE_ALLOW_UNAUTHENTICATED", "").lower() in (
+    "1", "true", "yes", "on")
+
+# ---- 绑定与访问控制 ----
+# 注意：Host 白名单只防 DNS rebinding（攻击者域名解析到 127.0.0.1 后借浏览器
+# 打本地服务），**它不构成鉴权**——Host 头是客户端自填的，攻击者直接写
+# `Host: 127.0.0.1:8000` 就能过。真正的屏障是「写只允许回环」。
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# 空串绝不能当成回环：ThreadingHTTPServer 绑 "" 等于监听所有网卡（等价 0.0.0.0）。
+# 之前写成 `or HOST == ""` 会让 `BRIDGE_HOST=` 直接绕过 fail-closed，
+# 局域网带伪造 Host 就能读到 /api/state。
+BOUND_TO_LOOPBACK = HOST in LOOPBACK_HOSTS
+ALLOWED_HOSTS = set(LOOPBACK_HOSTS)
+if HOST and HOST not in ("0.0.0.0", "::"):
+    ALLOWED_HOSTS.add(HOST)
+# 只有显式暴露到局域网时才接受本机网卡 IP，避免「已防护」的错觉
+LOCAL_IPS = set()
+if not BOUND_TO_LOOPBACK:
+    try:
+        LOCAL_IPS = set(socket.gethostbyname_ex(socket.gethostname())[2])
+    except Exception:  # 离线或网络异常时不阻断启动
+        LOCAL_IPS = set()
 CHAT_TTL = float(env("BRIDGE_CHAT_TTL", "30") or 30)         # 普通弹幕排队超过 N 秒就不回了
 GIFT_TTL = float(env("BRIDGE_GIFT_TTL", "120") or 120)       # 礼物感谢保留更久
 STREAM_REPLY = env("DEEPSEEK_STREAM", "1").lower() not in ("0", "false", "no", "off")
@@ -59,7 +104,15 @@ LATEST = {
 }
 _last_run = 0.0
 LATEST_AUDIO = ""          # 本地 TTS 产出的最新 wav 路径
-TTS_BACKEND = env("TTS_BACKEND", "local").lower()   # local(本地 say) | vidu(云端对口型)
+TTS_BACKEND_ERROR = ""
+try:
+    # piper(本地) / say(macOS) / sapi(Windows) / vidu(云端对口型) / auto(按平台探测)
+    TTS_BACKEND = resolve_backend()
+except (ValueError, RuntimeError) as _e:
+    # 不能在 import 阶段就退出：CI 会在 ubuntu 上 import bridge 跑单测，
+    # 而 Linux 既没有 say 也没有 sapi。这里记下原因，等到启动或首次合成时报错。
+    TTS_BACKEND = "auto"
+    TTS_BACKEND_ERROR = str(_e)
 HISTORY = deque(maxlen=int(env("HISTORY_TURNS", "8") or 8))   # 记忆最近 N 轮对话，让回复能接上下文
 USER_MEMORY = {}           # 昵称 -> deque([(弹幕, 回复), ...]) 按人记忆，提升用户亲和性
 REPLIES = deque(maxlen=30) # 已完成的回复队列（供前端排队播放，避免下一条覆盖上一条）
@@ -184,75 +237,6 @@ def filter_reply(text):
     return text
 
 
-def say_tts(text, voice):
-    """本地 TTS：调用 macOS `say`，直接输出 WAV。"""
-    os.makedirs("audio", exist_ok=True)
-    out = os.path.join("audio", f"reply_{time.time_ns()}.wav")   # 按句合成时同一毫秒可能有多段
-    subprocess.run(
-        ["say", "-v", voice, "-o", out,
-         "--file-format=WAVE", "--data-format=LEI16@22050", text],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return out
-
-
-_PIPER_VOICE = None
-
-
-def _load_piper():
-    """懒加载 Piper 音色（zh_CN-xiao_ya），只加载一次。"""
-    global _PIPER_VOICE
-    if _PIPER_VOICE is None:
-        from piper import PiperVoice
-        from pathlib import Path
-        _PIPER_VOICE = PiperVoice.load(
-            Path("piper_voices/zh_CN-xiao_ya-medium.onnx"),
-            download_dir=Path("piper_voices"),
-        )
-    return _PIPER_VOICE
-
-
-def piper_tts(text):
-    """本地 Piper TTS：预热后极快（约 20 倍实时）。输出 22050Hz wav。"""
-    voice = _load_piper()
-    import numpy as np
-    import wave
-    os.makedirs("audio", exist_ok=True)
-    out = os.path.join("audio", f"reply_{time.time_ns()}.wav")   # 按句合成时同一毫秒可能有多段
-    chunks = list(voice.synthesize(text))
-    pcm = np.concatenate([c.audio_int16_array for c in chunks])
-    with wave.open(out, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(22050)
-        w.writeframes(pcm.astype(np.int16).tobytes())
-    return out
-
-
-def _warmup_piper():
-    """后台预热：加载模型 + 跑一次空合成，避免第一条回复卡顿。"""
-    try:
-        v = _load_piper()
-        list(v.synthesize("。"))
-    except Exception:
-        pass
-
-
-def pick_say_voice(content):
-    """本地模式：按弹幕关键词选择 macOS `say` 音色，返回 (voice, 标签)。"""
-    default = env("SAY_VOICE", "Tingting")
-    raw = env("SAY_VOICE_MAP", "")
-    mapping = {}
-    if raw:
-        try:
-            mapping = json.loads(raw)
-        except Exception:
-            mapping = {}
-    for label in sorted(mapping, key=len, reverse=True):
-        if label and label in content:
-            return mapping[label], label
-    return default, "默认"
-
-
 def user_context(nick):
     """按昵称取该观众最近几轮对话，让数字人记得「上次和这个人聊过什么」。"""
     mem = USER_MEMORY.get(nick)
@@ -287,13 +271,24 @@ def try_switch_model(content):
 
 
 def local_tts(text, say_voice=None):
-    """本地 TTS：Piper（失败回落 say）或 macOS say，返回 wav 路径。"""
-    if TTS_BACKEND == "piper":
-        try:
-            return piper_tts(text)
-        except Exception:  # noqa: BLE001
-            traceback.print_exc()
-    return say_tts(text, say_voice or env("SAY_VOICE", "Tingting"))
+    """本地 TTS：统一委派给 tts_backend（piper / macOS say / Windows sapi）。
+
+    两点与上游原实现等价：
+      - Piper 运行期失败时回落到平台原生音色，不让直播直接哑掉；
+      - vidu 模式下进场播报/礼物感谢/换角色提示这类短句仍走本地合成——
+        它们不经过 process_one 的 vidu 分支，而 tts_backend 没有实现 vidu
+        （云端对口型在 process_one 里单独处理），不兜底就会全部报错。
+    """
+    if TTS_BACKEND_ERROR:
+        raise RuntimeError(f"TTS 后端不可用：{TTS_BACKEND_ERROR}")
+    backend = resolve_backend("auto") if TTS_BACKEND == "vidu" else TTS_BACKEND
+    try:
+        return tts_synthesize(text, say_voice or None, backend=backend)
+    except Exception:  # noqa: BLE001
+        if backend != "piper":
+            raise
+        traceback.print_exc()
+        return tts_synthesize(text, say_voice or None, backend=native_backend())
 
 
 def _push_reply(entry, wav_path):
@@ -522,8 +517,8 @@ def process_one(item):
                 GIFT_LOG.append({"nick": user, "item": item.get("gift_item"),
                                  "num": item.get("gift_num"), "value": item.get("gift_value")})
 
-        if TTS_BACKEND in ("local", "piper"):
-            say_voice, voice_label = pick_say_voice(content)
+        if TTS_BACKEND != "vidu":
+            say_voice, voice_label = pick_local_voice(content)
             if STREAM_REPLY:
                 reply, emotion = stream_reply(content, user, voice_label, say_voice, timings)
             else:
@@ -561,7 +556,7 @@ def process_one(item):
             timings["render_wait"] = round(time.time() - t0, 2)
 
             t0 = time.time()
-            local_path = download(video_url, "output")
+            local_path = download(video_url, os.path.join(BASE_DIR, "output"))
             timings["download"] = round(time.time() - t0, 2)
 
             with LOCK:
@@ -747,11 +742,10 @@ def director_tick_loop():
         time.sleep(0.2)
 
 
-_here = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(_here, "avatar.html"), encoding="utf-8") as _f:
+with open(os.path.join(BASE_DIR, "avatar.html"), encoding="utf-8") as _f:
     AVATAR_HTML = _f.read()
-LIVE2D_DIR = os.path.join(_here, "live2d")
-STATIC_DIR = os.path.join(_here, "static")
+LIVE2D_DIR = os.path.join(BASE_DIR, "live2d")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 
 PREVIEW_HTML = """<!doctype html>
@@ -807,13 +801,90 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        # 页面 URL 可能带 ?token=，必须阻止它随 Referer 泄漏到任何外部资源。
+        # 用响应头而不是 <meta name="referrer">：meta 只对其后发起的请求生效，
+        # 有人把远程资源挪到 meta 之前就会静默失效；响应头覆盖所有响应且改不掉。
+        self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(data)
 
+    # ---------- 访问控制 ----------
+
+    def _host_ok(self):
+        """校验 Host 头（阻断 DNS rebinding）。"""
+        raw = (self.headers.get("Host") or "").strip()
+        if not raw:
+            return True                    # HTTP/1.0 客户端不带 Host，放行避免误伤
+        if raw.startswith("["):            # [::1] 或 [::1]:8000 —— 不能按冒号切
+            end = raw.find("]")
+            host = raw[1:end] if end > 0 else raw
+        else:
+            host = raw.rsplit(":", 1)[0]
+        return host.strip().lower() in ALLOWED_HOSTS or host.strip() in LOCAL_IPS
+
+    def _is_loopback_client(self):
+        """请求是否来自本机（本机转发器与浏览器无需携带令牌）。"""
+        ip = (self.client_address[0] if self.client_address else "") or ""
+        return (ip.startswith("127.") or ip in ("::1", "0:0:0:0:0:0:0:1")
+                or ip == "::ffff:127.0.0.1")
+
+    def _token_ok(self, allow_query=False):
+        """只读视图令牌校验。
+
+        回环客户端免校验（本机转发器与 OBS 浏览器源照常工作）；非回环客户端
+        必须带对令牌。只有页面入口（GET /）允许用 ?token= 传令牌——那是用户
+        手输的入口，浏览器无法在地址栏带自定义头。
+        """
+        if not BRIDGE_TOKEN:
+            return True          # 仅在回环绑定或显式 ALLOW_UNAUTHENTICATED 下出现
+        if self._is_loopback_client():
+            return True
+        got = self.headers.get("X-Bridge-Token") or ""
+        if not got and allow_query:
+            try:
+                got = (parse_qs(urlsplit(self.path).query).get("token") or [""])[0]
+            except ValueError:
+                got = ""
+        if not got:
+            return False
+        return hmac.compare_digest(got.encode("utf-8"), TOKEN_B)
+
+    def _origin_ok(self):
+        """校验 Origin（阻断跨站 POST）。非浏览器客户端不带 Origin，放行。"""
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        try:
+            parts = urlsplit(origin)
+        except ValueError:
+            return False
+        host = (parts.hostname or "").lower()
+        if host not in ALLOWED_HOSTS and host not in LOCAL_IPS:
+            return False
+        # 端口也要比：否则任意本地端口的页面都能对本服务发起跨站请求
+        try:
+            port = parts.port
+        except ValueError:
+            return False
+        if port is None:
+            return PORT in (80, 443)
+        return port == PORT
+
+    def _deny(self):
+        return self._send(403, {"error": "forbidden: host/origin not allowed"})
+
     def do_GET(self):
-        if self.path in ("/", "/avatar"):
+        if not self._host_ok():
+            return self._deny()
+        # 先剥掉 query 再匹配路径：否则带 ?token= 的入口会被后面所有分支漏掉
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/avatar"):
+            if not self._token_ok(allow_query=True):
+                return self._send(401, {"error": "bad token"})
             return self._send(200, AVATAR_HTML, "text/html; charset=utf-8")
-        if self.path.split("?", 1)[0] == "/api/state":
+        if path == "/api/state":
+            if not self._token_ok():
+                return self._send(401, {"error": "bad token"})
             # ?since=<action_seq>：只返回该序号之后的动作，前端高频轮询时减小负载。
             # 不传则返回全部最近动作（兼容旧调用方）。
             since = 0
@@ -834,6 +905,8 @@ class Handler(BaseHTTPRequestHandler):
                 d["director"] = DIRECTOR.snapshot()
                 return self._send(200, d)
         if self.path.startswith("/audio"):
+            if not self._token_ok():
+                return self._send(401, {"error": "bad token"})
             p = None
             if "seq=" in self.path:
                 try:
@@ -849,6 +922,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, f.read(), "audio/wav")
             return self._send(404, {"error": "no audio yet"})
         if self.path.startswith("/video"):
+            if not self._token_ok():
+                return self._send(401, {"error": "bad token"})
             with LOCK:
                 p = LATEST.get("local_path", "")
             if p and os.path.exists(p):
@@ -901,12 +976,26 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self._host_ok() or not self._origin_ok():
+            return self._deny()
         if self.path == "/api/danmaku":
+            # 写入口只允许本机：转发器 cyber-xiaoya-danmaku 永远连
+            # http://127.0.0.1:8000，远程写没有真实需求。
+            # 返回 403 而不是 401 —— 避免转发器把「远程写被禁」误判成令牌过期
+            # 去反复重试；同时明确区分「没权限做这件事」与「令牌不对」。
+            if not self._is_loopback_client():
+                return self._send(403, {"error": "remote write disabled"})
             try:
-                n = int(self.headers.get("Content-Length", 0))
+                n = int(self.headers.get("Content-Length", 0) or 0)
+                if n <= 0:
+                    return self._send(400, {"error": "empty body"})
+                if n > MAX_BODY:
+                    return self._send(413, {"error": "payload too large"})
                 body = json.loads(self.rfile.read(n) or b"{}")
             except Exception:
                 return self._send(400, {"error": "bad json"})
+            if not isinstance(body, dict):
+                return self._send(400, {"error": "json object required"})
             kind = (body.get("kind") or "").strip()
             priority = (body.get("priority") or "normal").strip()
             action = None
@@ -968,9 +1057,59 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def check_auth_config():
+    """启动前的鉴权配置检查（失败关闭）。
+
+    默认配置（127.0.0.1）不受影响。一旦绑到非回环地址，必须提供足够长的
+    只读令牌，否则拒绝启动——避免用户在不知情的情况下把弹幕流与音频暴露给
+    整个局域网。
+
+    即使配了令牌，也要注意：令牌只保护读，写入口已经硬性限定回环。
+    """
+    if BOUND_TO_LOOPBACK:
+        return
+    if ALLOW_UNAUTHENTICATED:
+        print("[安全警告] BRIDGE_HOST=%s 已暴露到局域网，且未设置只读令牌。" % HOST)
+        print("           同网段任何人都能查看弹幕与音频（写入口仍只允许本机）。")
+        return
+    if not BRIDGE_TOKEN:
+        raise SystemExit(
+            "[配置错误] BRIDGE_HOST=%s 会把服务暴露到局域网，但 BRIDGE_TOKEN 为空。\n"
+            "  请二选一：\n"
+            "    1) 设置 BRIDGE_TOKEN=<至少 16 位的随机串>，用 ?token= 打开页面\n"
+            "    2) 设 BRIDGE_ALLOW_UNAUTHENTICATED=1 明确接受只读暴露\n"
+            "  注：写入口 /api/danmaku 无论如何都只允许本机访问，\n"
+            "  所以远程无法替你消耗 API 额度。" % HOST)
+    if len(BRIDGE_TOKEN) < MIN_TOKEN_LEN:
+        raise SystemExit(
+            "[配置错误] BRIDGE_TOKEN 太短（%d 位），暴露到局域网时至少需要 %d 位。"
+            % (len(BRIDGE_TOKEN), MIN_TOKEN_LEN))
+    if not BRIDGE_TOKEN.isascii():
+        # http.server 用 latin-1 解码请求头，而 parse_qs 按 UTF-8 解码 query。
+        # 非 ASCII 令牌在这两条路径上会得到不同的字节序列，导致「URL 里能用、
+        # 请求头里 401」这种诡异现象。强制 ASCII 后两种编码等价，两条路径天然
+        # 一致——不要去分路径 encode，那会留下只在一条路径正确的分支。
+        raise SystemExit(
+            "[配置错误] BRIDGE_TOKEN 只能包含 ASCII 字符（建议用随机串）。\n"
+            "  生成：python -c \"import secrets;print(secrets.token_urlsafe(24))\"")
+
+
 if __name__ == "__main__":
-    if TTS_BACKEND == "piper":
-        _warmup_piper()  # 同步预热（阻塞几秒，避免与 worker 线程竞争加载 g2pw 模型）
+    configure_console()   # Windows 下输出重定向时不因 GBK 编码崩溃
+    check_auth_config()
+    if TTS_BACKEND_ERROR:
+        # 支持平台上没有可用 TTS 就是配置错误，直接退出比跑起来再哑掉好。
+        # Linux 只用于 CI 跑接口/单测（既无 say 也无 sapi），放行但明确告警，
+        # 否则 CI 里所有需要启动服务的用例都会失败。
+        _msg = f"TTS 后端不可用：{TTS_BACKEND_ERROR}"
+        if os.name == "nt" or sys.platform == "darwin":
+            raise SystemExit(f"[配置错误] {_msg}")
+        print(f"[警告] {_msg}")
+        print("       当前平台无原生 TTS，服务仍会启动，但合成语音会失败；仅适合接口调试。")
+    # Piper 预热（阻塞几秒，避免与 worker 线程竞争加载模型）。
+    # auto 模式下预热失败会回落到平台原生后端，这里接住实际生效的后端，
+    # 免得拖到第一条回复才报错。
+    TTS_BACKEND = tts_warmup(TTS_BACKEND)
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=director_tick_loop, daemon=True).start()
     threading.Thread(target=gift_board_saver, daemon=True).start()
@@ -980,8 +1119,10 @@ if __name__ == "__main__":
     print(f"  - 收弹幕：     POST http://{HOST}:{PORT}/api/danmaku")
     print(f"  - 查状态：     GET  http://{HOST}:{PORT}/api/state")
     print(f"  - 本地音频：   GET  http://{HOST}:{PORT}/audio")
+    print(f"  TTS 后端 = {TTS_BACKEND}"
+          f"（piper=本地模型 / say=macOS / sapi=Windows / vidu=云端对口型）")
+    print(f"  工作目录 = {BASE_DIR}")
     print(f"  - 礼物规则：   {DIRECTOR.snapshot().get('rules', 0)} 条（config/gift_actions.json）")
-    print(f"  渲染后端 TTS_BACKEND = {TTS_BACKEND}（local=本地 say / vidu=云端对口型）")
     print(f"  回复模式 = {'流式按句合成' if STREAM_REPLY else '整段合成'}（DEEPSEEK_STREAM）"
           f"；弹幕过期 {CHAT_TTL:g}s / 礼物过期 {GIFT_TTL:g}s")
     print("提示：开播前请确认 .env 已填 DeepSeek Key。")

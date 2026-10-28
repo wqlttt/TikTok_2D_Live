@@ -17,6 +17,17 @@ echo "=============================================="
 echo "  赛博小雅 · 一键部署"
 echo "=============================================="
 
+# ---------- 0. 平台守卫 ----------
+# 本脚本依赖 bash + BSD/GNU 工具链，Windows 请用 setup.ps1。
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    err "检测到 Windows 环境（Git Bash）。
+    请改用 PowerShell 执行：
+      powershell -NoProfile -ExecutionPolicy Bypass -File setup.ps1
+    详见 README.md 的「Windows」章节。"
+    ;;
+esac
+
 # ---------- 1. 依赖检查 ----------
 info "检查依赖..."
 command -v python3 >/dev/null || err "缺少 python3"

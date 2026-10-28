@@ -1,0 +1,17 @@
+# TikTok 2D Live · 运行时依赖
+#
+# 安装：
+#   python -m pip install -r requirements.txt
+#
+# 说明：bridge.py 只用标准库，但通过 verify_pipeline 调用 DeepSeek / Vidu
+# 的 HTTP 接口，因此需要 requests；配置读取需要 python-dotenv。
+
+requests>=2.28
+python-dotenv>=1.0
+
+# ---------------------------------------------------------------
+# 可选：本地 Piper TTS（音质最好，跨平台，需要 Python 3.10+）
+#   pip install "piper-tts[zh]" unicode-rbnf
+# 另需下载音色与 g2pw 多音字模型，见 README「本地 TTS：Piper」。
+# 未安装时 TTS_BACKEND=auto 会自动回落到 macOS say / Windows sapi。
+# ---------------------------------------------------------------

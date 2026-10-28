@@ -1,6 +1,8 @@
 # ============ 敏感配置：绝不提交 ============
 # 含 API Key / Token / Cookie / 房间号
 .env
+.env.*
+!.env.example
 douyinLive/config.yaml
 cyber-xiaoya-danmaku/config.json
 
@@ -21,6 +23,7 @@ logs/
 gift_board.json
 gift_board.json.tmp
 /piper_voices/
+.vscode/
 
 # ============ macOS ============
 .DS_Store

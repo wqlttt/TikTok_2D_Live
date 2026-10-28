@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>赛博小雅 · Live2D 虚拟人</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:transparent;}
@@ -96,6 +97,23 @@
   var lastDanmaku = "";
   var audioCtx = null, analyser = null;
 
+  // 只读视图令牌：从地址栏 ?token=xxx 读取（局域网访问时用）。
+  // 服务端不再把令牌注入页面——那样任何能打开页面的人都能拿到，等于没保护。
+  // 本机访问时后端直接放行，这里为空也不影响。
+  var BRIDGE_TOKEN = "";
+  try {
+    BRIDGE_TOKEN = new URLSearchParams(window.location.search).get("token") || "";
+  } catch (e) { BRIDGE_TOKEN = ""; }
+  function apiFetch(url, opts){
+    opts = opts || {};
+    if (BRIDGE_TOKEN){
+      var h = opts.headers || {};
+      h["X-Bridge-Token"] = BRIDGE_TOKEN;
+      opts.headers = h;
+    }
+    return fetch(url, opts);
+  }
+
   function setOpenness(o){ if (motion) motion.setLevel(o); }
 
   var loadToken = 0;
@@ -185,7 +203,7 @@
     return new Promise(function(resolve){
       try {
         ensureAudio();
-        fetch("/audio?seq=" + seq + "&t=" + Date.now())
+        apiFetch("/audio?seq=" + seq + "&t=" + Date.now())
           .then(function(r){ if(!r.ok) throw new Error("bad"); return r.arrayBuffer(); })
           .then(function(buf){ return audioCtx.decodeAudioData(buf); })
           .then(function(audioBuf){
@@ -389,7 +407,7 @@
 
   async function poll(){
     try {
-      var r = await fetch("/api/state" + (actionInit ? "?since=" + lastActionSeq : ""));
+      var r = await apiFetch("/api/state" + (actionInit ? "?since=" + lastActionSeq : ""));
       var s = await r.json();
       updateStatus(s);
       // LLM 生成期间（还没开口）进入「思考」状态：抬眼、歪头、皱眉，填补等待空档
