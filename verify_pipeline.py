@@ -67,7 +67,8 @@ def require(cond, msg):
 
 
 # ---------------- 第 1 步：DeepSeek 回复 ----------------
-def deepseek_reply(danmaku: str, nick: str = "", history=None, user_context: str = "") -> str:
+def _deepseek_request(danmaku: str, nick: str, history, user_context: str, stream: bool):
+    """组装 DeepSeek 请求，返回 (url, headers, json_body)。"""
     key = env("DEEPSEEK_API_KEY")
     model = env("DEEPSEEK_MODEL", "deepseek-chat")
     persona = env("PERSONA_PROMPT", DEFAULT_PERSONA)
@@ -83,23 +84,51 @@ def deepseek_reply(danmaku: str, nick: str = "", history=None, user_context: str
     ctx = f"\n[你之前和这位观众聊过：{user_context}]" if user_context else ""
     messages.append({"role": "user", "content": f"弹幕{who}：{danmaku}{ctx}"})
 
-    resp = requests.post(
-        DEEPSEEK_URL,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        },
-        timeout=60,
-    )
+    url = env("DEEPSEEK_URL", DEEPSEEK_URL)
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": stream,
+    }
+    return url, headers, body
+
+
+def deepseek_reply(danmaku: str, nick: str = "", history=None, user_context: str = "") -> str:
+    url, headers, body = _deepseek_request(danmaku, nick, history, user_context, stream=False)
+    resp = requests.post(url, headers=headers, json=body, timeout=60)
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+def deepseek_stream(danmaku: str, nick: str = "", history=None, user_context: str = ""):
+    """流式版本：逐段 yield 文本增量（OpenAI 兼容 SSE：`data: {...}` / `data: [DONE]`）。
+
+    用于「边生成边合成语音」：拿到第一句就能开口，不必等整段生成完。
+    """
+    url, headers, body = _deepseek_request(danmaku, nick, history, user_context, stream=True)
+    # (连接超时, 两次数据之间的读超时)
+    with requests.post(url, headers=headers, json=body, stream=True, timeout=(10, 60)) as resp:
+        resp.raise_for_status()
+        for raw in resp.iter_lines(decode_unicode=False):
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+                delta = chunk["choices"][0].get("delta") or {}
+            except (ValueError, KeyError, IndexError, TypeError):
+                continue
+            text = delta.get("content")
+            if text:
+                yield text
 
 
 # ---------------- 第 2 步：TTS（Vidu 云端语音合成） ----------------

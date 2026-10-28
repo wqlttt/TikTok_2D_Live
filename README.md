@@ -318,6 +318,21 @@ bash setup_piper.sh   # 安装 piper-tts + 下载音色(小雅) + g2pw 模型(~2
 | `SAY_VOICE` | macOS `say` 音色（默认 `Tingting`） |
 | `SAY_VOICE_MAP` | 弹幕关键词→音色（JSON） |
 | `BRIDGE_HOST` / `BRIDGE_PORT` | 桥监听地址/端口 |
+| `DEEPSEEK_STREAM` | `1`（默认）流式生成 + 按句合成，第一句生成完就开口；`0` 整段生成后再合成 |
+| `BRIDGE_MIN_INTERVAL` | 两条回复最少间隔秒数（默认 3，在后台节奏控制里生效，礼物不受限） |
+| `BRIDGE_MAX_QUEUE` | 排队上限（默认 20） |
+| `BRIDGE_CHAT_TTL` / `BRIDGE_GIFT_TTL` | 弹幕 / 礼物感谢排队多久后放弃（默认 30s / 120s） |
+
+### 回复调度
+
+入口只负责入队，从不因「回得太快」丢弃消息；后台按以下规则挑下一条：
+
+- **优先级**：礼物 > VIP（`priority: "vip"`）> 提问/点名（含 `？`、`吗`、`小雅`、`主播`、`@` 等）> 普通弹幕/播报，同级先来先回
+- **过期**：排队超过 TTL 的直接丢弃，不回复过时弹幕
+- **去重**：带 `event_id` 的按它去重（120s 窗口）；相同弹幕文本 10s 内只回一次（防刷屏）
+- **合并**：同一观众排队中的礼物合并成一次感谢（同名礼物合计数量）
+
+`/api/state` 的 `queue` 字段给出当前深度和 `expired` / `evicted` / `deduped` / `rejected` 计数；`timings` 里的 `first_audio` 是从开始处理到第一句语音合成完成的耗时。
 
 ## 换 Live2D 模型
 

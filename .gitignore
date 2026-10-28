@@ -19,6 +19,7 @@ __pycache__/
 logs/
 *.log
 gift_board.json
+gift_board.json.tmp
 /piper_voices/
 
 # ============ macOS ============

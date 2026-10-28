@@ -251,16 +251,37 @@
   var lastPlayedSeq = 0;
   var isPlaying = false;
   var queueInit = false;
+  // 流式回复会拆成多段（同一 reply_id，part 递增，最后一段 final=true）。
+  // 段与段之间可能有短暂空档，不能一播完就收气泡，否则会闪烁。
+  var lastItem = null, idleSince = 0;
+  var finalSeqs = {};
+  var HIDE_AFTER_FINAL_MS = 600, HIDE_AFTER_PARTIAL_MS = 6000;
+
+  function maybeHideSpeech(){
+    if (isPlaying || !speechEl.classList.contains("show") || !idleSince) return;
+    var done = !lastItem || lastItem.final !== false || finalSeqs[lastItem.seq];
+    var idle = Date.now() - idleSince;
+    if ((done && idle >= HIDE_AFTER_FINAL_MS) || idle >= HIDE_AFTER_PARTIAL_MS){
+      hideSpeech();
+      idleSince = 0;
+    }
+  }
 
   function enqueueReplies(replies){
-    if (!replies || replies.length === 0) return;
-    // 首次加载：跳到当前最新一条，不重播历史（避免刷新后卡住）
+    replies = replies || [];
+    // 首次加载：跳到当前最新一条，不重播历史（避免刷新后卡住）。
+    // 必须在「空列表」时也完成初始化——否则桥刚启动时第一条回复会被当成历史跳过。
     if (!queueInit){
       queueInit = true;
       for (var i = 0; i < replies.length; i++){
         if (replies[i].seq > lastPlayedSeq) lastPlayedSeq = replies[i].seq;
       }
       return;
+    }
+    if (replies.length === 0) return;
+    // 「最后一段」标记是服务端在生成结束后补上的，每次轮询都刷新一下
+    for (var k = 0; k < replies.length; k++){
+      if (replies[k].final) finalSeqs[replies[k].seq] = true;
     }
     for (var i = 0; i < replies.length; i++){
       var r = replies[i];
@@ -275,11 +296,15 @@
   function playNext(){
     if (playQueue.length === 0){
       isPlaying = false;
-      setTimeout(hideSpeech, 600);   // 队列空，语音播完后稍作停留再隐藏气泡
+      if (!idleSince) idleSince = Date.now();   // 每次轮询都会走到这里，不能重置计时
+      // 整句说完：稍作停留再收气泡；还有后续分段：等下一段，超时兜底
+      setTimeout(maybeHideSpeech, HIDE_AFTER_FINAL_MS);
       return;
     }
     isPlaying = true;
+    idleSince = 0;
     var item = playQueue.shift();
+    lastItem = item;
     showSpeech(item.reply);
     playAudio(item.seq).then(function(){ playNext(); });
   }
@@ -391,7 +416,8 @@
         currentModelName = s.model;
         loadModel(currentModelName);
       }
-      if (s.replies && s.replies.length) enqueueReplies(s.replies);
+      if (Array.isArray(s.replies)) enqueueReplies(s.replies);
+      maybeHideSpeech();
       if (giftPlayer && Array.isArray(s.actions)) {
         var serverSeq = Number(s.action_seq) || 0;
         // bridge 重启后 action_seq 会归零；前端跟着重置，避免一直不播新动作。
